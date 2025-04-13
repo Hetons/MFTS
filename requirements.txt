@@ -1,6 +1,6 @@
 matplotlib==3.5.3
 numpy==1.21.6
-scapy==2.5.0
+scapy==2.4.3
 tldextract==5.1.2                     
 scikit-learn
 loguru==0.6.0
