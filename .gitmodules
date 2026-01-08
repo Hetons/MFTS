@@ -1,4 +1,0 @@
-[submodule "traffic_collect"]
-	path = traffic_collect
-	url = git@github.com:TanYongF/encrypt_traffic.git
-	branch = master
