@@ -1,0 +1,143 @@
+from math import ceil
+import os
+from typing import Dict, List
+import json
+import pandas as pd
+import numpy as np
+import numpy as np
+from const import *
+import logging
+from typing import Iterable, Iterator, Tuple, Any
+import math
+
+
+def flush_shard(X_buf, y_buf, edge_buf, edge_attr_buf, out_dir, shard_idx):
+    # 1) X / y
+    X = np.stack(X_buf).astype(np.float32)  # [N, M, D]
+    y = np.asarray(y_buf, dtype=np.int64)  # [N]
+
+    # 2) edges + edge_ptr
+    edge_ptr = [0]
+    for e in edge_buf:
+        e = np.asarray(e, dtype=np.int64)
+        edge_ptr.append(edge_ptr[-1] + e.shape[1])
+    edge_ptr = np.asarray(edge_ptr, dtype=np.int64)  # [N+1]
+
+    if edge_ptr[-1] == 0:
+        edges = np.zeros((2, 0), dtype=np.int64)
+    else:
+        edges = np.concatenate(edge_buf, axis=1).astype(np.int64)  # [2, total_E]
+
+    # 2) edge_attr
+    edge_attr = np.concatenate(edge_attr_buf, axis=0).astype(np.float32)
+
+    # 3) save
+    np.save(os.path.join(out_dir, f"X_{shard_idx:03d}.npy"), X)
+    np.save(os.path.join(out_dir, f"y_{shard_idx:03d}.npy"), y)
+    np.save(os.path.join(out_dir, f"edges_{shard_idx:03d}.npy"), edges)
+    np.save(os.path.join(out_dir, f"edge_ptr_{shard_idx:03d}.npy"), edge_ptr)
+    np.save(os.path.join(out_dir, f"edge_attr_{shard_idx:03d}.npy"), edge_attr)
+
+    # 4) log
+    logging.info(
+        f"Flushed shard {shard_idx:03d}: N={X.shape[0]}, M={X.shape[1]}, D={X.shape[2]}, total_E={edges.shape[1]}"
+    )
+
+
+def save_dataset_sharded(
+    sample_iter: Iterable,
+    out_dir: str,
+    shard_size: int = 50000,
+    meta: dict[str, object] | None = None,
+    shuffle: bool = True,
+    seed: int = 42,
+):
+    os.makedirs(out_dir, exist_ok=True)
+    X_buf, y_buf, edge_index_buf, edge_attr_buf = [], [], [], []
+    total_samples = 0
+    shard_idx = 0
+    rng = np.random.default_rng(seed)
+    for X_i, edge_i, y_i, edge_attr_i in sample_iter:
+        X_buf.append(X_i)
+        edge_index_buf.append(edge_i)
+        y_buf.append(y_i)
+        edge_attr_buf.append(edge_attr_i)
+        if len(X_buf) >= shard_size:
+            if shuffle:
+                logging.info(
+                    "Shuffling shard", shard_idx, "with", len(X_buf), "samples"
+                )
+                perm = rng.permutation(len(X_buf))
+                X_buf = [X_buf[i] for i in perm]
+                edge_index_buf = [edge_index_buf[i] for i in perm]
+                y_buf = [y_buf[i] for i in perm]
+                edge_attr_buf = [edge_attr_buf[i] for i in perm]
+            flush_shard(X_buf, y_buf, edge_index_buf, edge_attr_buf, out_dir, shard_idx)
+            total_samples += len(X_buf)
+            shard_idx += 1
+            X_buf, y_buf, edge_index_buf, edge_attr_buf = [], [], [], []
+
+    if X_buf:
+        if shuffle:
+            perm = rng.permutation(len(X_buf))
+            X_buf = [X_buf[i] for i in perm]
+            edge_index_buf = [edge_index_buf[i] for i in perm]
+            y_buf = [y_buf[i] for i in perm]
+            edge_attr_buf = [edge_attr_buf[i] for i in perm]
+        flush_shard(X_buf, y_buf, edge_index_buf, edge_attr_buf, out_dir, shard_idx)
+        total_samples += len(X_buf)
+        shard_idx += 1
+
+    # meta upate
+    if meta is None:
+        meta = {}
+    meta["sinker_shard_size"] = shard_size
+    meta["sinker_num_shards"] = shard_idx
+    meta["sinker_total_samples"] = total_samples
+    meta["sinker_shuffle"] = shuffle
+
+    with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+
+# 保存成 tensor 张量 todo
+def sink_tensors_file(flows, output_dir):
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    # TLS Layer Feature
+    """
+        "tls_vers":"0x303",
+        "tls_len":"0x7a",
+        "tls_step":2,
+        "tls_shlen":118,
+        "tls_cip":4865,
+        "tls_comp":0,
+        "tls_extlen":46,
+        "tls_exttype":43
+    """
+
+    tls_records: List[Dict] = []
+
+    for i, (flow_id, feature) in enumerate(flows.items()):
+        # Convert packet info to a PyTorch tensor
+        handshake_payload = feature.get("handshake", [])
+        if len(handshake_payload) > 0:
+            tls_records.append(handshake_payload[0])
+
+    fields = [
+        "tls_vers",
+        "tls_len",
+        "tls_step",
+        "tls_shlen",
+        "tls_cip",
+        "tls_comp",
+        "tls_extlen",
+        "tls_exttype",
+    ]
+    df = pd.DataFrame(tls_records)
+    df = df.reindex(columns=fields)  # 保证列顺序并只留需要字段
+    df = df.fillna("")  # 用默认值填充
+    # 转为 numpy 字符串矩阵或做后续编码
+    X_str = df.to_numpy(dtype=object)
+    logging.info(X_str)
