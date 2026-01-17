@@ -1,6 +1,39 @@
 import os
 from scapy.layers.inet import IP, TCP
 from typing import Dict, Tuple
+from scapy.all import *
+
+# Scapy 2.7.0 TLS 导入
+try:
+    from scapy.layers.tls.handshake import (
+        TLSClientHello,
+        TLSServerHello,
+        TLSCertificate,
+        TLSServerKeyExchange,
+        TLSServerHelloDone,
+    )
+    from scapy.layers.tls.record import TLS
+    from scapy.layers.tls.extensions import TLS_Ext_ServerName
+
+    # Scapy 2.7.0 没有 TLSHandshake 基类，需要检查所有子类
+    TLS_HANDSHAKE_TYPES = (
+        TLSClientHello,
+        TLSServerHello,
+        TLSCertificate,
+        TLSServerKeyExchange,
+        TLSServerHelloDone,
+    )
+    TLS_AVAILABLE = True
+except ImportError as e:
+    TLS_AVAILABLE = False
+    TLS = None
+    TLS_HANDSHAKE_TYPES = ()
+    print(f"✗ TLS 模块导入失败: {e}")
+except AttributeError as e:
+    TLS_AVAILABLE = False
+    TLS = None
+    TLS_HANDSHAKE_TYPES = ()
+    print(f"✗ TLS 模块导入失败 (AttributeError): {e}")
 
 
 # 过滤pcap文件，只提取指定四元组的报文
@@ -86,39 +119,122 @@ def is_uplink(packet, flow_id):
 
 # 提取流的 握手包内容, 需要具体内容
 def extract_handshake_payload(packet) -> Tuple[Dict, bool]:
-    # Read packets from the pcap file
     tls_data = {}
-    vaild_handshake = False
-    if not packet.haslayer("SSL/TLS"):
+    valid_handshake = False
+
+    # 检查 TLS 模块是否可用
+    if not TLS_AVAILABLE or TLS is None:
         return tls_data, False
-    tls = packet.getlayer("SSL/TLS")
-    if "TLS Record" not in tls:
-        # logging.info(f"No TLS Record found in packet: {packet.summary()}")
-        return {}, False
-    tls_data["tls_vers"] = hex(tls["TLS Record"].version)  # 0x303: TLS 1.2
-    tls_data["tls_len"] = hex(tls["TLS Record"].length)
-    if "TLS Handshake" in tls:
-        tls_data["tls_step"] = tls["TLS Handshake"].type
-        if tls_data["tls_step"] == 2:  # Server Hello
-            # tls server hello length
-            tls_data["tls_shlen"] = tls["TLS Handshake"].length
-            # tls cipher ECDHE_RSA_WITH_AES_128_CBC_SHA256 0xc027 -> 49191
-            tls_data["tls_cip"] = tls["TLS Handshake"].cipher_suite
-            # tls compression method 0x00 -> 0
-            tls_data["tls_comp"] = tls["TLS Handshake"].compression_method
-            # tls extensions length 0x8 -> 8
-            tls_data["tls_extlen"] = "0x" + str(tls["TLS Handshake"].extensions_length)
-            # tls extensions type 0x000b -> 11
-            tls_data["tls_exttype"] = tls["TLS Extension"].type
-            vaild_handshake = True
-        elif tls_data["tls_step"] == 11:  # Certificate Message
-            tls.show()
-            # tls_data['tls_certificate'] = tls['TLS Handshake']
-        elif tls_data["tls_step"] == 12:  # Server Key Exchange todo
-            tls.show()
-        elif tls_data["tls_step"] == 14:  # Server Hello Done todo
-            tls.show()
-    return tls_data, vaild_handshake
+
+    # 1. 基础检查：必须包含 TLS 记录层
+    if not packet.haslayer(TLS):
+        return tls_data, False
+
+    # 2. 提取 TLS Record 基本信息
+    tls_layer = packet[TLS]
+    tls_data.update(
+        {
+            "tls_vers": hex(tls_layer.version),
+            "tls_len": hex(tls_layer.len) if tls_layer.len is not None else "0x0",
+        }
+    )
+
+    # 3. 检查握手消息类型
+    # 注意：TLS 1.2 会话恢复 (Session Resumption) 不包含 Certificate/ServerKeyExchange/ServerHelloDone
+    # 简化握手: ClientHello → ServerHello → ChangeCipherSpec
+    # 完整握手: ClientHello → ServerHello → Certificate → ServerKeyExchange → ServerHelloDone → ...
+    handshake = None
+    step = None
+
+    # 逐个检查具体的握手类型
+    if packet.haslayer(TLSClientHello):
+        handshake = packet[TLSClientHello]
+        step = 1
+    elif packet.haslayer(TLSServerHello):
+        handshake = packet[TLSServerHello]
+        step = 2
+    elif packet.haslayer(TLSCertificate):
+        handshake = packet[TLSCertificate]
+        step = 11
+    elif packet.haslayer(TLSServerKeyExchange):
+        handshake = packet[TLSServerKeyExchange]
+        step = 12
+    elif packet.haslayer(TLSServerHelloDone):
+        handshake = packet[TLSServerHelloDone]
+        step = 14
+
+    if handshake is None:
+        return tls_data, False
+
+    # --- Client Hello (1) ---
+    if step == 1:
+        tls_data["has_client_hello"] = 1
+        tls_data["ch_shlen"] = getattr(handshake, "len", 0)
+
+        # 提取密码套件和压缩方法
+        if hasattr(handshake, "ciphers") and handshake.ciphers:
+            tls_data["ch_cip"] = handshake.ciphers[0]
+        if hasattr(handshake, "comp") and handshake.comp:
+            tls_data["ch_comp"] = handshake.comp[0]
+
+        # 提取扩展信息
+        if hasattr(handshake, "ext"):
+            tls_data["ch_extlen"] = hex(len(handshake.ext))
+            if handshake.ext:
+                tls_data["ch_exttype"] = handshake.ext[0].type
+
+            # 优雅提取 SNI
+            if packet.haslayer(TLS_Ext_ServerName):
+                sni_ext = packet[TLS_Ext_ServerName]
+                if sni_ext.servernames:
+                    sni = sni_ext.servernames[0].servername.decode("utf-8", "ignore")
+                    tls_data.update(
+                        {
+                            "has_sni": 1,
+                            "sni_len": len(sni),
+                            "sni_hash": hash(sni) & 0xFFFFFFFF,
+                            "sni_label_count": len(sni.split(".")),
+                        }
+                    )
+        valid_handshake = True
+
+    # --- Server Hello (2) ---
+    elif step == 2:
+        tls_data["has_server_hello"] = 1
+        tls_data["sh_shlen"] = getattr(handshake, "len", 0)
+        tls_data["sh_cip"] = getattr(handshake, "cipher", 0)
+        tls_data["sh_comp"] = getattr(handshake, "comp", 0)
+        valid_handshake = True
+
+    # --- Certificate (11) ---
+    elif step == 11:
+        tls_data["has_certificate"] = 1
+        if hasattr(handshake, "certs"):
+            certs = handshake.certs
+            tls_data["cert_count"] = len(certs)
+            if certs:
+                # Scapy 2.7.0 中 certs 是一个列表，每个元素是一个 X509Cert 对象或原始字节
+                # 我们尝试获取第一张证书的长度
+                try:
+                    raw_cert = bytes(certs[0])
+                    tls_data["cert_len"] = len(raw_cert)
+                except:
+                    tls_data["cert_len"] = 0
+        valid_handshake = True
+
+    # --- Server Key Exchange (12) ---
+    elif step == 12:
+        tls_data["has_server_key_exchange"] = 1
+        tls_data["ske_len"] = getattr(handshake, "len", 0)
+        valid_handshake = True
+
+    # --- Server Hello Done (14) ---
+    elif step == 14:
+        tls_data["has_server_hello_done"] = 1
+        tls_data["shd_len"] = getattr(handshake, "len", 0)
+        valid_handshake = True
+
+    return tls_data, valid_handshake
 
 
 # 提取流信息的函数
@@ -168,7 +284,10 @@ def extract_flows(
             if "handshake" in extract_features:
                 handshake_payload, vaild = extract_handshake_payload(packet)
                 if vaild:
-                    flows[flow_id].setdefault("handshake", []).append(handshake_payload)
+                    # 合并握手信息到一个大字典中
+                    if "handshake" not in flows[flow_id]:
+                        flows[flow_id]["handshake"] = {}
+                    flows[flow_id]["handshake"].update(handshake_payload)
             if "payload_length" in extract_features:
                 flows[flow_id].setdefault("payload_length", []).append(
                     get_payload_length(packet)
@@ -179,80 +298,6 @@ def extract_flows(
                 )
             if "dst_ip" in extract_features:
                 flows[flow_id].setdefault("dst_ip", get_flow_ips(packet)[1])
-
-    return flows
-
-
-def extract_flows_dpkt(
-    pcap_file: str, extract_features: list, vaild_flow_ids=None
-) -> Dict[str, Dict]:
-    import dpkt
-
-    if not os.path.exists(pcap_file):
-        raise FileNotFoundError(f"PCAP file not found: {pcap_file}")
-
-    flows: Dict[str, Dict] = {}
-
-    with open(pcap_file, "rb") as f:
-        pcap = dpkt.pcap.Reader(f)
-        for ts, buf in pcap:
-            try:
-                eth = dpkt.ethernet.Ethernet(buf)
-            except (dpkt.UnpackError, ValueError):
-                continue
-
-            if not isinstance(eth.data, dpkt.ip.IP):
-                continue
-            ip = eth.data
-            if not isinstance(ip.data, dpkt.tcp.TCP):
-                continue
-            tcp = ip.data
-
-            src_ip = ".".join(map(str, ip.src))
-            dst_ip = ".".join(map(str, ip.dst))
-            flow_id = (src_ip, tcp.sport, dst_ip, tcp.dport)
-            reverse_flow_id = (dst_ip, tcp.dport, src_ip, tcp.sport)
-            bi_flow_id = min(flow_id, reverse_flow_id)
-
-            if vaild_flow_ids is not None and bi_flow_id not in vaild_flow_ids:
-                continue
-
-            raw_flow_id = tuple(bi_flow_id)
-            flow_key = str(bi_flow_id)
-            if flow_key not in flows:
-                flows[flow_key] = {}
-
-            if "flow_start_time" in extract_features:
-                if "flow_start_time" not in flows[flow_key]:
-                    flows[flow_key]["flow_start_time"] = float(ts)
-
-            if "packet_length" in extract_features:
-                pkt_len = len(buf)
-                if is_uplink_stub(src_ip, tcp.sport, raw_flow_id):
-                    flows[flow_key].setdefault("packet_length", []).append(pkt_len)
-                else:
-                    flows[flow_key].setdefault("packet_length", []).append(-pkt_len)
-
-            if "timestamp" in extract_features:
-                flows[flow_key].setdefault("timestamp", []).append(float(ts))
-
-            if "flags" in extract_features:
-                flows[flow_key].setdefault("flags", []).append(hex(int(tcp.flags)))
-
-            if "payload_length" in extract_features:
-                flows[flow_key].setdefault("payload_length", []).append(len(tcp.data))
-
-            if "direction" in extract_features:
-                direction = (
-                    "uplink"
-                    if is_uplink_stub(src_ip, tcp.sport, raw_flow_id)
-                    else "downlink"
-                )
-                flows[flow_key].setdefault("direction", []).append(direction)
-
-            if "handshake" in extract_features:
-                # dpkt 不处理 TLS 握手解析，保持为空
-                pass
 
     return flows
 

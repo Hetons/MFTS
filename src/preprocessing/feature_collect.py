@@ -5,6 +5,7 @@ from typing_extensions import override
 from const import *
 from typing import Type
 from flow_extract import build_vaild_flow_ids, extract_flows
+from tls_exact import encode_tls_features
 from itertools import permutations
 import math
 import logging
@@ -18,49 +19,6 @@ def pad_trunc_1d(arr, L: int, pad_value=0.0, dtype: Type[np.floating] = np.float
     out = np.full((L,), pad_value, dtype=dtype)
     out[: a.size] = a
     return out
-
-
-def stats_18(x: np.ndarray) -> np.ndarray:
-    """
-    返回 18 维统计特征：
-    min,max,mean,mad,std,var,skew,kurt, p10..p90(9个), count
-    空输入 -> 全 0
-    """
-    x = np.asarray(x, dtype=np.float32)
-    if x.size == 0:
-        return np.zeros(18, dtype=np.float32)
-
-    # 基本统计
-    xmin = np.min(x)
-    xmax = np.max(x)
-    mean = np.mean(x)
-    mad = np.mean(np.abs(x - mean))
-    var = np.var(x)
-    std = np.sqrt(var)
-
-    # skew/kurt（不依赖 scipy）
-    # 注意：std==0 时避免除 0
-    if std > 1e-12:
-        z = (x - mean) / std
-        skew = np.mean(z**3)
-        kurt = np.mean(z**4) - 3.0
-    else:
-        skew = 0.0
-        kurt = 0.0
-
-    # 分位数（p10..p90）
-    percs = np.percentile(x, np.arange(10, 100, 10)).astype(np.float32)
-
-    cnt = np.float32(x.size)
-
-    out = np.concatenate(
-        [
-            np.array([xmin, xmax, mean, mad, std, var, skew, kurt], dtype=np.float32),
-            percs,
-            np.array([cnt], dtype=np.float32),
-        ]
-    )
-    return out  # (18,)
 
 
 class EdgeIndexBuilder:
@@ -184,18 +142,54 @@ class EdgeIndexBuilder:
         )
 
 
+class TLSHeaderTensorCollector:
+    def __init__(self, threshold: float = 0.3):
+        """_summary_
+
+        Args:
+            threshold (float, optional): The time threshold. Defaults to 0.3.
+        """
+        self.threshold = threshold
+
+
+    def _do_collect(self, flows: dict, tls_node_padding: int) -> np.ndarray:
+        # 按照 flow_start_time 排序并过滤时间窗口内的 flows
+        flows_list = sorted(flows.values(), key=lambda x: x.get("flow_start_time", 0.0))
+
+        if flows_list:
+            threshold_time = flows_list[0].get("flow_start_time", 0.0) + self.threshold
+            flows_list = [
+                f for f in flows_list if f.get("flow_start_time", 0.0) <= threshold_time
+            ]
+            T_i = encode_tls_features(flows_list, threshold_time)
+
+        # padding or truncate to fixed tls_node_padding, dim = 0
+        if T_i.shape[0] < tls_node_padding:
+            T_i = np.vstack(
+                [T_i, np.zeros((tls_node_padding - T_i.shape[0], T_i.shape[1]))]
+            )
+        elif T_i.shape[0] > tls_node_padding:
+            T_i = T_i[:tls_node_padding]
+
+        return T_i
+
+
 class GraphTensorCollector:
     def __init__(
         self,
-        sample_file_dir: str = "",
-        num_flow_padding: int = 32,
-        num_packet_padding: int = 128,
-        edge_build_method: str = "spatio_temporal",
+        sample_file_dir: str = "",  # sample files director
+        num_flow_padding: int = 32,  # flow num padding
+        num_packet_padding: int = 128,  # packet num padding
+        edge_build_method: str = "spatio_temporal",  # edge building method
+        tls_node_padding: int = 8,  # number of TLS nodes
+        tls_threshold: float = 0.3,  # time threshold, only get [flow_start_time, flow_start_time + threshold] flows for TLS feature
     ):
         self.sample_file_dir = sample_file_dir
         self.expected_num_flows = num_flow_padding
         self.expected_packet_length = num_packet_padding
         self.edge_build_method = edge_build_method
+        self.tls_node_padding = tls_node_padding
+        self.tls_threshold = tls_threshold
 
     def _output_node_feature_dimension(self) -> int:
         raise NotImplementedError
@@ -225,6 +219,8 @@ class GraphTensorCollector:
             "collector_num_packet_padding": self.expected_packet_length,
             "collector_edge_build_method": self.edge_build_method,
             "collector_node_feature_dim": self._output_node_feature_dimension(),
+            "collector_tls_node_padding": self.tls_node_padding,
+            "collector_tls_threshold": self.tls_threshold,
         }
 
     def sample_iter(self):
@@ -268,7 +264,7 @@ class GraphTensorCollector:
                         "flow_start_time",
                         "flags",
                         "dst_ip",
-                        # "handshake",
+                        "handshake",
                     ],
                     vaild_flow_ids=vaild_flow_ids,
                 )
@@ -276,11 +272,11 @@ class GraphTensorCollector:
                 if len(flows) == 0:
                     continue
 
-                # Save flows, Only for test
-                # sink_json_file(flows, output_dir, f"{website_idx}-{instance_id}")
-
-                # sink_tensors_file(flows, output_dir)
-                # encode_tls_features_and_save(flows, output_dir, f"{website_idx}-{instance_id}")
+                # collect TLS features
+                tls_header_collector = TLSHeaderTensorCollector(
+                    threshold=self.tls_threshold
+                )
+                T_i = tls_header_collector._do_collect(flows, self.tls_node_padding)
 
                 X_i, edge_i, y_i, edge_attr = self._do_collect(
                     flows,
@@ -299,7 +295,106 @@ class GraphTensorCollector:
                         f"Processed {idx} instances, now processing for website {website_name}"
                     )
 
-                yield X_i, edge_i, y_i, edge_attr
+                yield X_i, edge_i, y_i, edge_attr, T_i
+
+
+class CUMULTensorCollector:
+    def __init__(self, sample_file_dir, expected_packet_length=100):
+        self.sample_file_dir = sample_file_dir
+        self.expected_packet_length = expected_packet_length
+    
+    def get_meta(self) -> dict[str, object]:
+        return {
+            "created_by": self.__class__.__name__,
+            "created_time": str(np.datetime64("now")),
+            "collector_sample_file_dir": self.sample_file_dir,
+            "collector_num_packet_padding": self.expected_packet_length,
+        }
+
+    
+    def _do_collect(
+        self,
+        flows: dict,
+        packet_nums_padding: int,
+        website_id: int,
+    ):
+        # 提取每个流的包长序列
+        packet_lengths = [flow.get("packet_length", []) for flow in flows.values()]
+        X_i = []
+        for pkt_len_seq in packet_lengths:
+            pkt_len_seq = pad_trunc_1d(pkt_len_seq, packet_nums_padding, pad_value=0)
+            X_i.append(pkt_len_seq)
+
+        flow_nums = len(X_i)
+        Y_i = flow_nums * [website_id]
+        return X_i, Y_i
+
+    def sample_iter(self):
+        idx = 1
+        website_idx = -1
+        for website_name in os.listdir(self.sample_file_dir):
+            website_idx = website_idx + 1
+            website_folder = os.path.join(self.sample_file_dir, website_name)
+            if not os.path.isdir(website_folder):
+                continue
+
+            for instance_id in os.listdir(website_folder):
+                data_dir = os.path.join(website_folder, instance_id)
+                if not os.path.isdir(data_dir):
+                    continue
+                # Find pcap file and summary file
+                pcap_file = None
+                summary_file = None
+                for filename in os.listdir(data_dir):
+                    if filename == "traffic.pcap":
+                        pcap_file = os.path.join(data_dir, filename)
+                    elif filename == "summary.txt":
+                        summary_file = os.path.join(data_dir, filename)
+
+                if pcap_file is None or summary_file is None:
+                    continue
+
+                # Build valid flow IDs
+                vaild_flow_ids = build_vaild_flow_ids(summary_file)
+                if len(vaild_flow_ids) == 0:
+                    continue
+
+                # Extract packet lengths for each TCP flow
+                flows = extract_flows(
+                    pcap_file,
+                    extract_features=[
+                        "packet_length",
+                        "payload_length",
+                        "direction",
+                        "timestamp",
+                        "flow_start_time",
+                        "flags",
+                        "dst_ip",
+                        "handshake",
+                    ],
+                    vaild_flow_ids=vaild_flow_ids,
+                )
+
+                if len(flows) == 0:
+                    continue
+
+                X_i, y_i = self._do_collect(
+                    flows,
+                    self.expected_packet_length,
+                    website_idx,
+                )
+
+                # filter zero
+                if np.all(np.array(X_i) == 0):
+                    continue
+
+                idx = idx + 1
+                if idx % 100 == 0:
+                    logging.info(
+                        f"Processed {idx} instances, now processing for website {website_name}"
+                    )
+
+                yield X_i, y_i
 
 
 class STGCGraphTensorCollector(GraphTensorCollector):
