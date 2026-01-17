@@ -3,3 +3,5 @@ raw_feature/*
 results/*
 cora.tgz
 .vscode
+/notebooks/runs
+/runs
