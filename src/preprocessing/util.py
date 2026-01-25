@@ -1,4 +1,15 @@
 import numpy as np
+from typing import Type
+
+
+def pad_trunc_1d(arr, L: int, pad_value=0.0, dtype: Type[np.floating] = np.float32):
+
+    a = np.asarray(arr, dtype=dtype)
+    if a.size >= L:
+        return a[:L]
+    out = np.full((L,), pad_value, dtype=dtype)
+    out[: a.size] = a
+    return out
 
 
 # 把 hex 字符串(如 '0x7a') 或字符串数字 转为 int，对于不能转换的填 0

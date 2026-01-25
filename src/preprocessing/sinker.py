@@ -46,6 +46,44 @@ def flush_shard(X_buf, y_buf, edge_buf, edge_attr_buf, T_buf, out_dir, shard_idx
     )
 
 
+def tatic_tensor_sinker(
+    sample_iter: Iterable, out_dir: str, meta: dict[str, object] | None = None
+):
+    os.makedirs(out_dir, exist_ok=True)
+
+    # 针对 Tatic 模型，我们需要输出 CSV 格式
+    # 格式：identifier, "['val1', val2, ...]", label
+    csv_path = os.path.join(out_dir, "tatic_features.csv")
+
+    total_samples = 0
+    with open(csv_path, "w", encoding="utf-8") as f:
+        for instance_id, X_i, y_i in sample_iter:
+            # X_i: List of interleaved flows, shape [num_flows, 3*num_packs]
+            # y_i: List of labels, shape [num_flows]
+            for flow_idx, (features, label) in enumerate(zip(X_i, y_i)):
+                # 构建标识符: 如 airbnb-01.txt_0
+                identifier = f"{instance_id}_{flow_idx}"
+
+                # 构建特征字符串: "[val1, val2, ...]"
+                feature_str = str(features)
+
+                # 写入 CSV (手动构建以确保格式正确)
+                f.write(f'{identifier},"{feature_str}",{label}\n')
+                total_samples += 1
+
+    # 保存元数据
+    if meta is None:
+        meta = {}
+    meta["sinker_total_samples"] = total_samples
+    meta["sinker_format"] = "csv"
+    meta["sinker_csv_path"] = os.path.abspath(csv_path)
+
+    with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    logging.info(f"Sink Tatic data: total_samples={total_samples}, saved to {csv_path}")
+
+
 def cumul_tensor_sinker(
     sample_iter: Iterable,
     out_dir: str,

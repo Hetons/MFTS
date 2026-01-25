@@ -1,6 +1,7 @@
 from curses import use_env
 import select
 from turtle import pos
+from arrow import get
 import torch
 import torch.nn as nn
 from torch.nn import Softmax
@@ -15,17 +16,97 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 
+def get_tls_meta() -> tuple[list[str], list[bool]]:
+    # min,max,mean,mad,std,var,skew,kurt, p10..p90(9个), count
+    stat18_list = [
+        "min",
+        "max",
+        "mean",
+        "mad",
+        "std",
+        "var",
+        "skew",
+        "kurt",
+        "p10",
+        "p20",
+        "p30",
+        "p40",
+        "p50",
+        "p60",
+        "p70",
+        "p80",
+        "p90",
+        "count",
+    ]
+    fields = [
+        "tls_vers",
+        "tls_len",
+        # ClientHello 字段
+        "ch_shlen",
+        "ch_cip",
+        "ch_comp",
+        "ch_extlen",
+        "ch_exttype",
+        "has_client_hello",
+        # SNI 字段
+        "sni_len",
+        "sni_hash",
+        "sni_label_count",
+        "has_sni",
+        # ServerHello 字段
+        "sh_shlen",
+        "sh_cip",
+        "sh_comp",
+        "sh_extlen",
+        "sh_exttype",
+        "has_server_hello",
+        # Certificate 字段
+        "cert_chain_len",
+        "cert_count",
+        "cert_len",
+        "has_certificate",
+        # Server Key Exchange 字段
+        "ske_len",
+        "ske_curve_type",
+        "has_server_key_exchange",
+        # Server Hello Done 字段
+        "shd_len",
+        "has_server_hello_done",
+    ]
+
+    fields.extend("all_" + stat for stat in stat18_list)
+    fields.extend("inbound_" + stat for stat in stat18_list)
+    fields.extend("outbound_" + stat for stat in stat18_list)
+    selected_fields = [
+        "sh_cip",
+        "outbound_min",
+        "inbound_min",
+        "outbound_max",
+        "all_max",
+        "inbound_p40",
+        "inbound_p10",
+    ]
+    to_remove = ["sni_hash", "sni_label_count", "sni_len", "has_sni"]
+    selected_fields = [f for f in selected_fields if f not in to_remove]
+    mask = [field in selected_fields for field in fields]
+    # print(f"Total TLS feature dimensions: {len(fields)}")
+    return fields, mask
+
+
 class ShardedGraphDataset(torch.utils.data.Dataset):
-    def __init__(self, root, augment_sni=False, sni_mask_prob=0.0):
+    def __init__(
+        self,
+        root,
+        normalize=True,
+    ):
         """
         Args:
             root: 数据根目录
             augment_sni: 是否对 SNI 特征进行数据增强
             sni_mask_prob: SNI 特征被随机遮蔽的概率（0-1），用于减少对 SNI 的依赖
+            selected_features: 要使用的特征列表。如果为None，使用所有默认特征
         """
         self.root = root
-        self.augment_sni = augment_sni
-        self.sni_mask_prob = sni_mask_prob
         self.shard_ids = sorted(
             [
                 int(os.path.basename(p).split("_")[1].split(".")[0])
@@ -38,6 +119,29 @@ class ShardedGraphDataset(torch.utils.data.Dataset):
             n = x.shape[0]
             self.index.extend([(sid, i) for i in range(n)])
         self._cache = {}
+        self.normalize = normalize
+        if self.normalize:
+            self._compute_norm_stats()
+
+    def _compute_norm_stats(self):
+        """计算 TLS 特征的均值和标准差，用于归一化"""
+        print("Computing normalization stats...")
+        indices = [i for i in range(len(self))]
+        samples = []
+        for idx in indices:
+            sid, local_idx = self.index[idx]
+            shard_data = self._load_shard(sid)
+            T = shard_data["T"][local_idx]
+            feature_dim = T.shape[1]
+            mask = self._get_tls_feature_mask(feature_dim)  # 预热
+            T = T[:, mask]
+            samples.append(T)
+        samples = np.concatenate(samples, axis=0)
+        self.mean = samples.mean(axis=0)
+        self.std = samples.std(axis=0) + 1e-8  # 避免除0
+        print(f"✓ Normalization stats computed:")
+        print(f"  Mean range: [{self.mean.min():.2f}, {self.mean.max():.2f}]")
+        print(f"  Std range: [{self.std.min():.2f}, {self.std.max():.2f}]")
 
     def __len__(self):
         return len(self.index)
@@ -61,101 +165,20 @@ class ShardedGraphDataset(torch.utils.data.Dataset):
         if isinstance(y, np.ndarray) and y.ndim > 0:
             y = y.squeeze()
 
-        feature_dim = T.shape[1]
         # mask TLS features
+        feature_dim = T.shape[1]
         mask = self._get_tls_feature_mask(feature_dim)
         T = T[:, mask]
-        # 数据增强：随机遮蔽 SNI 特征，减少对 SNI 的依赖
-        if self.augment_sni and self.sni_mask_prob > 0:
-            if np.random.rand() < self.sni_mask_prob:
-                # SNI 字段索引: sni_len(5), sni_hash(6), sni_label_count(7)
-                sni_indices = [5, 6, 7]
-                for sni_idx in sni_indices:
-                    T[:, sni_idx] = 0  # 随机遮蔽 SNI 特征
 
+        if self.normalize:
+            T = (T - self.mean) / self.std
         return torch.tensor(T, dtype=torch.float32), torch.tensor(y, dtype=torch.long)
 
-    def _get_tls_feature_mask(self, feature_dim) -> np.ndarray:
+    def _get_tls_feature_mask(self, feature_dim: int) -> np.ndarray:
         # 期望字段顺序（与 sink_tensors_file 保持一致）
-        fields = [
-            "tls_vers",
-            "tls_len",
-            # ClientHello 字段
-            "ch_shlen",  # remove
-            "ch_cip",
-            "ch_comp",  # remove
-            "ch_extlen",
-            "ch_exttype",
-            "has_client_hello",  # remove
-            # SNI 字段
-            "sni_len",
-            "sni_hash",
-            "sni_label_count",
-            "has_sni",  # remove
-            # ServerHello 字段
-            "sh_shlen",
-            "sh_cip",
-            "sh_comp",
-            "sh_extlen",
-            "sh_exttype",
-            "has_server_hello",  # remove
-            # Certificate 字段
-            "cert_chain_len",
-            "cert_count",
-            "cert_len",
-            "has_certificate",
-            # Server Key Exchange 字段
-            "ske_len",
-            "ske_curve_type",
-            "has_server_key_exchange",
-            # Server Hello Done 字段
-            "shd_len",
-            "has_server_hello_done",
-            # Statiestic features
-            "pkt_len",
-            "umax",
-            "alen",
-            "uper9",
-            "dlen",
-            "dper8",
-            "dmean",
-        ]
-
-        # 只要 field 中的 client_hello, server_hello ， 并且不带 remove 注释的字段
-        selected_fields = [
-            "tls_vers",  # 需要 embedding - TLS 版本（离散分类）
-            "tls_len",  # 连续值
-            # ClientHello 字段
-            "ch_cip",  # 需要 embedding - 密码套件（离散分类）
-            "ch_extlen",  # 连续值
-            "ch_exttype",  # 需要 embedding - 扩展类型（离散分类）
-            # SNI 字段
-            # "sni_len",  # 连续值
-            # "sni_hash",  # 连续值（哈希后的数值）
-            # "sni_label_count",  # 连续值
-            # ServerHello 字段
-            "sh_shlen",  # 连续值
-            "sh_cip",  # 需要 embedding - 密码套件（离散分类）
-            "sh_comp",  # 需要 embedding - 压缩方法（离散分类）
-            "sh_extlen",  # 连续值
-            "sh_exttype",  # 需要 embedding - 扩展类型（离散分类）
-            # Stat
-            "pkt_len",
-            "umax",
-            "alen",
-            "uper9",
-            "dlen",
-            "dper8",
-            "dmean",
-        ]
-
-        mask = [field in selected_fields for field in fields]
-        # padding if feature_dim > len(fields)
-        if feature_dim > len(fields):
-            extra_dims = feature_dim - len(fields)
-            mask.extend([True] * extra_dims)
-        mask = np.array(mask)
-        return mask
+        feature_list, mask = get_tls_meta()
+        assert len(feature_list) == feature_dim
+        return np.array(mask)
 
 
 class FastTlsCNN(nn.Module):
@@ -205,10 +228,10 @@ class FastTlsCNN(nn.Module):
 
         x = x.permute(0, 2, 1)  # (N, E, S)
 
-        b3 = self.conv3(x)
-        b5 = self.conv5(x)
-        b7 = self.conv7(x)
-        x = torch.cat([b3, b5, b7], dim=1)
+        b3 = self.conv3(x)  # (N, E // 3, S)
+        b5 = self.conv5(x)  # (N, E // 3, S)
+        b7 = self.conv7(x)  # (N, E - 2 * (E // 3), S)
+        x = torch.cat([b3, b5, b7], dim=1)  # (N, E, S)
         x = torch.relu(self.norm1(self.merge(x)))
         x = F.dropout(x, p=self.dropout_param, training=self.training)
 
@@ -226,6 +249,139 @@ class FastTlsEvaluator:
         self.loader = loader
         self.device = device
         self.num_classes = num_classes
+
+    def feature_importance_analysis(self):
+        """
+        特征重要性分析 - 使用删除法
+        返回每个特征的重要性评分（准确率下降百分比）
+        """
+        from sklearn.metrics import balanced_accuracy_score
+
+        # 特征名称（与 _get_tls_feature_mask 中的 selected_fields 对应）
+        feature_names, mask = get_tls_meta()
+        feature_names = np.array(feature_names)[mask]
+
+        # 收集所有数据
+        X_all = []
+        y_all = []
+        with torch.no_grad():
+            for data, target in self.loader:
+                X_all.append(data)
+                y_all.append(target)
+
+        X_all = torch.cat(X_all, dim=0)  # (N, seq_len, features)
+        y_all = torch.cat(y_all, dim=0).cpu().numpy()
+
+        # 计算基准准确率
+        self.model.eval()
+        with torch.no_grad():
+            output = self.model(X_all.to(self.device))
+            baseline_pred = output.argmax(dim=1).cpu().numpy()
+            baseline_acc = balanced_accuracy_score(y_all, baseline_pred)
+
+        print(f"\n{'='*70}")
+        print(f"特征重要性分析（删除法）")
+        print(f"{'='*70}")
+        print(f"基准准确率: {baseline_acc:.4f}\n")
+        print(
+            f"{'特征ID':<8} {'特征名称':<20} {'准确率':<12} {'下降':<12} {'重要性%':<10}"
+        )
+        print(f"{'-'*70}")
+
+        importance = {}
+
+        for feature_idx in range(min(X_all.shape[2], len(feature_names))):
+            # 复制数据并删除该特征
+            X_masked = X_all.clone()
+            X_masked[:, :, feature_idx] = 0  # 将特征设为0
+
+            with torch.no_grad():
+                output = self.model(X_masked.to(self.device))
+                pred = output.argmax(dim=1).cpu().numpy()
+                acc = balanced_accuracy_score(y_all, pred)
+
+            # 计算重要性
+            drop = baseline_acc - acc
+            importance_pct = (drop / baseline_acc) * 100 if baseline_acc > 0 else 0
+            importance[feature_names[feature_idx]] = {
+                "drop": drop,
+                "importance_pct": importance_pct,
+                "acc_without": acc,
+            }
+
+            print(
+                f"{feature_idx:<8} {feature_names[feature_idx]:<20} {acc:<12.4f} {drop:<12.4f} {importance_pct:<10.2f}%"
+            )
+
+        print(f"{'-'*70}")
+
+        # 排序并显示最重要的特征
+        sorted_features = sorted(
+            importance.items(), key=lambda x: x[1]["drop"], reverse=True
+        )
+
+        print(f"\n最重要的特征（Top 30）:")
+        for i, (fname, stats) in enumerate(sorted_features[:30], 1):
+            print(f"  {i}. {fname:<20} 重要性: {stats['importance_pct']:>6.2f}%")
+
+        print(f"\n最不重要的特征（Bottom 10）:")
+        for i, (fname, stats) in enumerate(sorted_features[-10:], 1):
+            print(f"  {i}. {fname:<20} 重要性: {stats['importance_pct']:>6.2f}%")
+
+        return importance
+
+    def diagnose_feature_correlations(self):
+        """
+        诊断特征之间的相关性和冗余度
+        """
+        import numpy as np
+        from scipy.stats import spearmanr
+
+        print(f"\n{'='*70}")
+        print("特征相关性诊断")
+        print(f"{'='*70}")
+
+        # 收集数据
+        X_all = []
+        y_all = []
+        with torch.no_grad():
+            for data, target in self.loader:
+                X_all.append(data)
+                y_all.append(target)
+
+        X_all = torch.cat(X_all, dim=0)  # (N, seq_len, features)
+        y_all = torch.cat(y_all, dim=0).cpu().numpy()
+
+        # 取第一个时间步的特征进行分析
+        X_flat = X_all[:, 0, :].cpu().numpy()  # (N, features)
+
+        feature_names, mask = get_tls_meta()
+        feature_names = np.array(feature_names)[mask]
+
+        # 计算每个特征与标签的相关性
+        print("\n特征与标签的相关性（Spearman）:")
+        print(f"{'特征':<20} {'相关系数':<12} {'显著性':<10}")
+        print("-" * 45)
+
+        for i, name in enumerate(feature_names[: X_flat.shape[1]]):
+            corr, pval = spearmanr(X_flat[:, i], y_all)
+            print(f"{name:<20} {corr:>10.4f}  p={pval:.4f}")
+
+        # 检查特征方差
+        print(f"\n特征方差分析:")
+        print(
+            f"{'特征':<20} {'方差':<15} {'唯一值数':<10} {'最大值':<10} {'最小值':<10}"
+        )
+        print("-" * 50)
+
+        for i, name in enumerate(feature_names[: X_flat.shape[1]]):
+            variance = np.var(X_flat[:, i])
+            n_unique = len(np.unique(X_flat[:, i]))
+            max_val = np.max(X_flat[:, i])
+            min_val = np.min(X_flat[:, i])
+            print(
+                f"{name:<20} {variance:<15.4f} {n_unique:<10} {max_val:<10.4f} {min_val:<10.4f}"
+            )
 
     def evaluate_with_threshold(self, threshold: float):
         self.model.eval()
@@ -327,8 +483,13 @@ class FastTlsEvaluator:
 
 
 def train_cnn(
-    search_lr=3e-3, dropout_param=0.3, search_hidden_dim=256, search_pooling="max"
+    search_lr=3e-3,
+    dropout_param=0.3,
+    search_hidden_dim=256,
+    search_pooling="max",
+    save_folder: str = "./checkpoints",
 ):
+    os.makedirs(save_folder, exist_ok=True)
     model = FastTlsCNN(
         class_num=num_classes,
         d_model=input_dim,
@@ -352,16 +513,30 @@ def train_cnn(
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "norm_mean": dataset.mean,
+            "norm_std": dataset.std,
+            "config": {
+                "input_dim": input_dim,
+                "num_classes": num_classes,
+                "hidden_dim": search_hidden_dim,
+                "dropout_param": dropout_param,
+            },
+        },
+        f"{save_folder}/fast_tls_cnn.pth",
+    )
     return model
 
 
 if __name__ == "__main__":
-    root_dir = "/home/tyf/Project/Tantic/raw_feature/stgc_sp_only_index_tls_4"
+    root_dir = "/home/tyf/Project/Tantic/raw_feature/stgc_sp_all_class_tls_2"
     num_classes = 17 if "all_class" in root_dir else 14
     test_dataset_ratio = 0.2
-    p_ratio = 0.95
+    p_ratio = 0.99
 
-    dataset = ShardedGraphDataset(root_dir, augment_sni=False, sni_mask_prob=0.3)
+    dataset = ShardedGraphDataset(root_dir, normalize=True)
     input_dim, seq_len = dataset[0][0].shape[1], dataset[0][0].shape[0]
     print(f"Input dimension: {input_dim}, Sequence length: {seq_len}")
 
@@ -378,12 +553,22 @@ if __name__ == "__main__":
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=128, shuffle=False)
 
     model = train_cnn(
-        search_lr=1e-3, dropout_param=0.1, search_hidden_dim=1024, search_pooling="max"
+        search_lr=1e-3, dropout_param=0.1, search_hidden_dim=64, search_pooling="max"
     )
     evaluator = FastTlsEvaluator(model, val_loader, device, num_classes=num_classes)
 
+    # 特征重要性分析
+    print("\n" + "=" * 70)
+    print("开始特征重要性分析...")
+    print("=" * 70)
+    feature_importance = evaluator.feature_importance_analysis()
+    # 特征相关性诊断
+    print("\n" + "=" * 70)
+    print("特征相关性和冗余度诊断...")
+    print("=" * 70)
+    evaluator.diagnose_feature_correlations()
     base_acc, report = evaluator.evaluate()
-    print(f"Base accuracy on validation set: {base_acc:.4f}")
+    print(f"\nBase accuracy on validation set: {base_acc:.4f}")
     print("\n=== Classification Report ===")
     print(report)
 

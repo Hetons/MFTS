@@ -1,24 +1,15 @@
 # Encoding TLS features: one-hot for certain fields, others to int and save as matrix
 import os
+from struct import pack
 import numpy as np
 from typing_extensions import override
 from const import *
-from typing import Type
 from flow_extract import build_vaild_flow_ids, extract_flows
 from tls_exact import encode_tls_features
 from itertools import permutations
+from util import pad_trunc_1d
 import math
 import logging
-
-
-def pad_trunc_1d(arr, L: int, pad_value=0.0, dtype: Type[np.floating] = np.float32):
-
-    a = np.asarray(arr, dtype=dtype)
-    if a.size >= L:
-        return a[:L]
-    out = np.full((L,), pad_value, dtype=dtype)
-    out[: a.size] = a
-    return out
 
 
 class EdgeIndexBuilder:
@@ -151,7 +142,6 @@ class TLSHeaderTensorCollector:
         """
         self.threshold = threshold
 
-
     def _do_collect(self, flows: dict, tls_node_padding: int) -> np.ndarray:
         # 按照 flow_start_time 排序并过滤时间窗口内的 flows
         flows_list = sorted(flows.values(), key=lambda x: x.get("flow_start_time", 0.0))
@@ -174,7 +164,150 @@ class TLSHeaderTensorCollector:
         return T_i
 
 
-class GraphTensorCollector:
+class TensorCollector:
+    def __init__(
+        self,
+        sample_file_dir: str = "",  # sample files director
+    ):
+        self.sample_file_dir = sample_file_dir
+
+    def get_meta(self) -> dict[str, object]:
+        return {
+            "created_by": self.__class__.__name__,
+            "created_time": str(np.datetime64("now")),
+            "collector_sample_file_dir": self.sample_file_dir,
+        }
+
+    def sample_iter(self):
+        raise NotImplementedError
+
+
+class TaticTensorCollector(TensorCollector):
+    def __init__(self, sample_file_dir: str = "", packet_nums_padding=100):
+        super().__init__(sample_file_dir)
+        self.packet_nums_padding = packet_nums_padding
+
+    @override
+    def get_meta(self) -> dict[str, object]:
+        inherited_metadata = super().get_meta()
+        inherited_metadata.update(
+            {
+                "collector_num_packet_padding": self.packet_nums_padding,
+            }
+        )
+        return inherited_metadata
+
+    def _do_collect(
+        self,
+        flows: dict,
+        packet_nums_padding: int,
+        website_id: int,
+    ) -> tuple[list, list]:
+        flow_nums = len(flows)
+        # 提取每个流的包长序列
+        packet_lengths = [flow.get("packet_length", []) for flow in flows.values()]
+        packet_window_size = [flow.get("window_size", []) for flow in flows.values()]
+        packet_times = [flow.get("timestamp", []) for flow in flows.values()]
+        # packet times, diff with previous packet
+
+        X_i = []
+        for i in range(flow_nums):
+            pkt_len_seq = pad_trunc_1d(
+                packet_lengths[i], packet_nums_padding, pad_value=0.0
+            )
+            packet_window_size_seq = pad_trunc_1d(
+                packet_window_size[i], packet_nums_padding, pad_value=0.0
+            )
+
+            # ✓ 安全处理空时间戳
+            if len(packet_times[i]) > 1:
+                packet_diff_times = [0.0] + np.diff(packet_times[i]).tolist()
+            else:
+                packet_diff_times = [0.0] * (
+                    len(packet_times[i]) if len(packet_times[i]) > 0 else 1
+                )
+
+            packet_times_diff = pad_trunc_1d(
+                packet_diff_times, packet_nums_padding, pad_value=0.0
+            )
+
+            # ✓ 交叉构建：[pkt[0], win[0], time[0], pkt[1], win[1], time[1], ...]
+            stacked = np.column_stack(
+                [pkt_len_seq, packet_window_size_seq, packet_times_diff]
+            )
+            interleaved = stacked.flatten()  # 形状: (3*packet_nums_padding,)
+
+            X_i.append(interleaved.tolist())  # ✓ 转换为 list 保持一致性
+
+        # ✓ 使用实际处理后的数量
+        Y_i = len(X_i) * [website_id]
+        return X_i, Y_i
+
+    @override
+    def sample_iter(self):
+        idx = 1
+        website_idx = -1
+        for website_name in os.listdir(self.sample_file_dir):
+            website_idx = website_idx + 1
+            website_folder = os.path.join(self.sample_file_dir, website_name)
+            if not os.path.isdir(website_folder):
+                continue
+
+            for instance_id in os.listdir(website_folder):
+                data_dir = os.path.join(website_folder, instance_id)
+                if not os.path.isdir(data_dir):
+                    continue
+                # Find pcap file and summary file
+                pcap_file = None
+                summary_file = None
+                for filename in os.listdir(data_dir):
+                    if filename == "traffic.pcap":
+                        pcap_file = os.path.join(data_dir, filename)
+                    elif filename == "summary.txt":
+                        summary_file = os.path.join(data_dir, filename)
+
+                if pcap_file is None or summary_file is None:
+                    continue
+
+                # Build valid flow IDs
+                vaild_flow_ids = build_vaild_flow_ids(summary_file)
+                if len(vaild_flow_ids) == 0:
+                    continue
+
+                # Extract packet lengths for each TCP flow
+                flows = extract_flows(
+                    pcap_file,
+                    extract_features=[
+                        "packet_length",
+                        "timestamp",
+                        "window_size",
+                    ],
+                    vaild_flow_ids=vaild_flow_ids,
+                )
+
+                if len(flows) == 0:
+                    continue
+
+                X_i, y_i = self._do_collect(
+                    flows,
+                    self.packet_nums_padding,
+                    website_idx,
+                )
+
+                # filter zero
+                if np.all(np.array(X_i) == 0):
+                    continue
+
+                idx = idx + 1
+                if idx % 100 == 0:
+                    logging.info(
+                        f"Processed {idx} instances, now processing for website {website_name}"
+                    )
+
+                yield instance_id, X_i, y_i
+
+
+class GraphTensorCollector(TensorCollector):
     def __init__(
         self,
         sample_file_dir: str = "",  # sample files director
@@ -184,7 +317,7 @@ class GraphTensorCollector:
         tls_node_padding: int = 8,  # number of TLS nodes
         tls_threshold: float = 0.3,  # time threshold, only get [flow_start_time, flow_start_time + threshold] flows for TLS feature
     ):
-        self.sample_file_dir = sample_file_dir
+        super().__init__(sample_file_dir=sample_file_dir)
         self.expected_num_flows = num_flow_padding
         self.expected_packet_length = num_packet_padding
         self.edge_build_method = edge_build_method
@@ -210,19 +343,25 @@ class GraphTensorCollector:
         """
         raise NotImplementedError
 
+    @override
     def get_meta(self) -> dict[str, object]:
-        return {
-            "created_by": self.__class__.__name__,
-            "created_time": str(np.datetime64("now")),
-            "collector_sample_file_dir": self.sample_file_dir,
-            "collector_num_flows_padding": self.expected_num_flows,
-            "collector_num_packet_padding": self.expected_packet_length,
-            "collector_edge_build_method": self.edge_build_method,
-            "collector_node_feature_dim": self._output_node_feature_dimension(),
-            "collector_tls_node_padding": self.tls_node_padding,
-            "collector_tls_threshold": self.tls_threshold,
-        }
+        inherited_metadata = super().get_meta()
+        inherited_metadata.update(
+            {
+                "created_by": self.__class__.__name__,
+                "created_time": str(np.datetime64("now")),
+                "collector_sample_file_dir": self.sample_file_dir,
+                "collector_num_flows_padding": self.expected_num_flows,
+                "collector_num_packet_padding": self.expected_packet_length,
+                "collector_edge_build_method": self.edge_build_method,
+                "collector_node_feature_dim": self._output_node_feature_dimension(),
+                "collector_tls_node_padding": self.tls_node_padding,
+                "collector_tls_threshold": self.tls_threshold,
+            }
+        )
+        return inherited_metadata
 
+    @override
     def sample_iter(self):
         idx = 1
         website_idx = -1
@@ -298,20 +437,21 @@ class GraphTensorCollector:
                 yield X_i, edge_i, y_i, edge_attr, T_i
 
 
-class CUMULTensorCollector:
+class CUMULTensorCollector(TensorCollector):
     def __init__(self, sample_file_dir, expected_packet_length=100):
-        self.sample_file_dir = sample_file_dir
+        super().__init__(sample_file_dir=sample_file_dir)
         self.expected_packet_length = expected_packet_length
-    
-    def get_meta(self) -> dict[str, object]:
-        return {
-            "created_by": self.__class__.__name__,
-            "created_time": str(np.datetime64("now")),
-            "collector_sample_file_dir": self.sample_file_dir,
-            "collector_num_packet_padding": self.expected_packet_length,
-        }
 
-    
+    @override
+    def get_meta(self) -> dict[str, object]:
+        inherited_metadata = super().get_meta()
+        inherited_metadata.update(
+            {
+                "collector_num_packet_padding": self.expected_packet_length,
+            }
+        )
+        return inherited_metadata
+
     def _do_collect(
         self,
         flows: dict,
@@ -329,6 +469,7 @@ class CUMULTensorCollector:
         Y_i = flow_nums * [website_id]
         return X_i, Y_i
 
+    @override
     def sample_iter(self):
         idx = 1
         website_idx = -1

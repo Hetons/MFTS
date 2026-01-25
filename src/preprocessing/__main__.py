@@ -1,9 +1,9 @@
 from pyparsing import C
 from sinker import *
 from feature_collect import (
-    TanticGraphTensorCollector,
     STGCGraphTensorCollector,
     CUMULTensorCollector,
+    TaticTensorCollector,
 )
 import logging
 import warnings
@@ -21,26 +21,12 @@ def initialize_logging():
     logging.getLogger("scapy").setLevel(logging.ERROR)
 
 
-# 数据存放位置
-ROOT_DIR = "/home/tyf/Project/encrypt_traffic/train_raw_data"  # 本地数据存放路径
 # 远程数据存放路径
 REMOTE_RAW_DATA_DIR = "/home/tyf/fnnas/Study/Traffic-data/train_raw_data"
-# support : fully_connected | time_threshold | spatio_temporal
-EDGE_BUILD_METHOD = "spatio_temporal"
 # 存储预处理后特征的路径
-PRODUCT_OUTPUT_DIR = f"/home/tyf/Project/Tantic/raw_feature/stgc_sp_all_class_tls_2"
-# 样本维度   # 每个图的节点数,流数量
-FLOW_NUM_PADDING = 32
-# 默认前 20 个包
-PACKET_NUM_PADDING = 20
-# TLS 节点数
-TLS_NODE_PADDING = 8
-# 早期识别阶段 等待的时间阈值（s）
-TLS_THRESHOLD = 1.0
-# 每个 shard 包含的样本数
-SHARD_SIZE = 50000
+PRODUCT_OUTPUT_DIR = f"/home/tyf/Project/Tantic/raw_feature/tatic_all_class"
 
-
+# Cumul 数据集构建
 def collect_cumul():
     collector = CUMULTensorCollector(
         sample_file_dir=REMOTE_RAW_DATA_DIR, expected_packet_length=100
@@ -53,7 +39,21 @@ def collect_cumul():
     )
 
 
+# Tantic 数据集构建
 def collect_tantic():
+    # 样本维度   # 每个图的节点数,流数量
+    FLOW_NUM_PADDING = 32
+    # 默认前 20 个包
+    PACKET_NUM_PADDING = 20
+    # TLS 节点数
+    TLS_NODE_PADDING = 8
+    # 早期识别阶段 等待的时间阈值（s）
+    TLS_THRESHOLD = 1.0
+    # 每个 shard 包含的样本数
+    SHARD_SIZE = 50000
+    # support : fully_connected | time_threshold | spatio_temporal
+    EDGE_BUILD_METHOD = "spatio_temporal"
+
     # 1) initialize collector
     collector = STGCGraphTensorCollector(
         sample_file_dir=REMOTE_RAW_DATA_DIR,
@@ -74,6 +74,23 @@ def collect_tantic():
     )
 
 
+# Tatic 数据集构建
+def collect_tatic():
+    PACKET_NUM_PADDING = 100
+    # 1) initialize collector
+    collector = TaticTensorCollector(
+        sample_file_dir=REMOTE_RAW_DATA_DIR,
+        packet_nums_padding=PACKET_NUM_PADDING,
+    )
+
+    # 2) save dataset
+    tatic_tensor_sinker(
+        sample_iter=collector.sample_iter(),
+        out_dir=PRODUCT_OUTPUT_DIR,
+        meta=collector.get_meta(),
+    )
+
+
 if __name__ == "__main__":
 
     initialize_logging()
@@ -82,7 +99,8 @@ if __name__ == "__main__":
     # collect cumul features
     # collect_cumul()
     # collect tantic features
-    collect_tantic()
+    # collect_tantic()
+    collect_tatic()
 
     # 2) log
     logging.info("Dataset preprocessing completed.")
