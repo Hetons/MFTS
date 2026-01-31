@@ -93,7 +93,6 @@ class GATGraphClassifier(torch.nn.Module):
             heads=heads,
             dropout=dropout_param,
             edge_dim=2,
-            residual=True,
         )
         self.conv2 = GATv2Conv(
             hidden_dim * heads,
@@ -102,7 +101,6 @@ class GATGraphClassifier(torch.nn.Module):
             concat=True,
             dropout=dropout_param,
             edge_dim=2,
-            residual=True,
         )
         self.lin = torch.nn.Linear(hidden_dim, num_classes)
         self.sagPool = SAGPooling(hidden_dim, ratio=sag_pool_ratio)
@@ -116,20 +114,12 @@ class GATGraphClassifier(torch.nn.Module):
         x = self.norm1(x)
         x = F.elu(x)
         x = F.dropout(x, p=self.dropout_param, training=self.training)
-        # [num_grphas, M, hidden_dim * heads]
-
-        # x: [1024, 64]  [batch_size, hidden_dim * heads]
         x = self.conv2(x, edge_index, edge_attr)
         x = self.norm2(x)
         x = F.elu(x)
         x = F.dropout(x, p=self.dropout_param, training=self.training)
-        # x: [1024, 32]  [batch_size, hidden_dim] [1024, 32]
-        # x, edge_index, _, batch, _, _ = self.sagPool(x, edge_index, None, batch)
-        # x: [batch_size', hidden_dim] (batch_size' <= batch_size)
-        # x = global_mean_pool(x, batch)
-        # x = global_add_pool(x, batch)
+        x, edge_index, _, batch, _, _ = self.sagPool(x, edge_index, edge_attr, batch)
         x = global_max_pool(x, batch)
-        # 图级别池化 [32, 32] -> [batch_size, hidden_dim]
         return self.lin(x)  # [num_graphs, num_classes] [batch_size, num_classes]
 
 
@@ -189,11 +179,11 @@ class Evaluator:
         return cm
 
 
-def train_model():
-    root = "/home/tyf/Project/Tantic/raw_feature/stgc_sp_all_class_tls_2"
+def train_model(root: str):
+    is_save_model = False
     num_classes = 17
     test_dataset_ratio = 0.2
-    batch_size = 128
+    batch_size = 512
     dataset = ShardedGraphDataset(root, num_classes=num_classes)
     # 切分训练集和验证集 8 : 2
     n = len(dataset)
@@ -224,7 +214,7 @@ def train_model():
     loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights)
 
     search_heads = 8
-    search_hidden_dim = 256
+    search_hidden_dim = 128
     search_lr = 5e-4
     search_dropout = 0.1
     epochs = 100
@@ -255,124 +245,30 @@ def train_model():
             opt.step()
     val_acc, report = evaluator.evaluate()
     print(f"Validation Accuracy: {val_acc:.4f}, Total Parameters: {total_params}")
-    print("\n=== Classification Report ===")
-    print(report)
+    # print("\n=== Classification Report ===")
+    # print(report)
 
     # save model
-    save_path = "./checkpoints/payload_gnn_model.pth"
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "config": {
-                "in_dim": dataset[0].x.shape[1],
-                "hidden_dim": search_hidden_dim,
-                "num_classes": num_classes,
-                "heads": search_heads,
-                "dropout_param": search_dropout,
+    if is_save_model:
+        save_path = "./checkpoints/payload_gnn_model.pth"
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "config": {
+                    "in_dim": dataset[0].x.shape[1],
+                    "hidden_dim": search_hidden_dim,
+                    "num_classes": num_classes,
+                    "heads": search_heads,
+                    "dropout_param": search_dropout,
+                },
             },
-        },
-        save_path,
-    )
-    print(f"Model saved to {save_path}")
-
-
-#
-
-
-# def save_results_to_db(
-#     dataset_name: str,
-#     num_classes: int,
-#     batch_size: int,
-#     train_val_split: str,
-#     test_dataset_ratio: float,
-#     random_seed: int,
-#     best_params: dict,
-#     best_value: float,
-#     db_path: str = "training_results.db",
-# ):
-#     """手动保存训练结果到 SQLite 数据库"""
-#     import sqlite3
-
-#     conn = sqlite3.connect(db_path)
-#     cursor = conn.cursor()
-
-#     # 创建表（如果不存在）
-#     cursor.execute(
-#         """
-#         CREATE TABLE IF NOT EXISTS training_results (
-#             id INTEGER PRIMARY KEY AUTOINCREMENT,
-#             dataset_name TEXT,
-#             num_classes INTEGER,
-#             batch_size INTEGER,
-#             train_val_split TEXT,
-#             test_dataset_ratio REAL,
-#             random_seed INTEGER,
-#             heads INTEGER,
-#             hidden_dim INTEGER,
-#             lr REAL,
-#             dropout REAL,
-#             total_parameters INTEGER,
-#             best_accuracy REAL,
-#             created_at TEXT
-#         )
-#     """
-#     )
-
-#     # 插入结果
-#     cursor.execute(
-#         """
-#         INSERT INTO training_results
-#         (dataset_name, num_classes, batch_size, train_val_split, test_dataset_ratio,
-#          random_seed, heads, hidden_dim, lr, dropout, total_parameters, best_accuracy, created_at)
-#         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-#     """,
-#         (
-#             dataset_name,
-#             num_classes,
-#             batch_size,
-#             train_val_split,
-#             test_dataset_ratio,
-#             random_seed,
-#             best_params.get("heads"),
-#             best_params.get("hidden_dim"),
-#             best_params.get("lr"),
-#             best_params.get("dropout"),
-#             best_params.get("total_parameters"),
-#             best_value,
-#             time.strftime("%Y-%m-%d %H:%M:%S"),
-#         ),
-#     )
-
-#     conn.commit()
-#     conn.close()
-#     print(f"Results saved to {db_path}")
+            save_path,
+        )
+        print(f"Model saved to {save_path}")
 
 
 if __name__ == "__main__":
-    train_model()
-    # study = optuna.create_study(direction="maximize")
-    # study.optimize(objective, n_trials=50)
-
-    # print("Best value:", study.best_value)
-    # print("Best params:", study.best_params)
-
-    # 获取最佳 trial 的参数量
-    # best_trial = study.best_trial
-    # best_params_with_total = study.best_params.copy()
-    # best_params_with_total["total_parameters"] = best_trial.user_attrs.get(
-    #     "total_parameters", 0
-    # )
-
-    # 保存结果到自定义数据库
-    # dataset_name = os.path.basename(root)
-    # save_results_to_db(
-    #     dataset_name=dataset_name,
-    #     num_classes=num_classes,
-    #     batch_size=batch_size,
-    #     train_val_split=f"{n_train}:{n_val}",
-    #     test_dataset_ratio=test_dataset_ratio,
-    #     random_seed=42,
-    #     best_params=best_params_with_total,
-    #     best_value=study.best_value,
-    #     db_path="training_results.db",
-    # )
+    root = "/home/tyf/Project/Tantic/raw_feature/stgc_sp_all_class_tls_3"
+    for i in range(5):
+        print(f"--- Training Round {i+1} ---")
+        train_model(root)

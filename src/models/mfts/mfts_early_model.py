@@ -10,6 +10,7 @@ import numpy as np
 import glob
 import optuna
 import torch.nn.functional as F
+from sklearn.model_selection import train_test_split
 
 # 指定 device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -181,7 +182,7 @@ class ShardedGraphDataset(torch.utils.data.Dataset):
         return np.array(mask)
 
 
-class FastTlsCNN(nn.Module):
+class MftsEarlyModel(nn.Module):
     def __init__(
         self,
         class_num=3,
@@ -190,7 +191,7 @@ class FastTlsCNN(nn.Module):
         dropout_param=0.1,
         pooling_method: str = "max",
     ):
-        super(FastTlsCNN, self).__init__()
+        super(MftsEarlyModel, self).__init__()
         # d_model 输入维度
         self.conv1 = nn.Conv1d(
             in_channels=d_model, out_channels=hidden_dim, kernel_size=3, padding=1
@@ -490,7 +491,7 @@ def train_cnn(
     save_folder: str = "./checkpoints",
 ):
     os.makedirs(save_folder, exist_ok=True)
-    model = FastTlsCNN(
+    model = MftsEarlyModel(
         class_num=num_classes,
         d_model=input_dim,
         hidden_dim=search_hidden_dim,
@@ -531,7 +532,7 @@ def train_cnn(
 
 
 if __name__ == "__main__":
-    root_dir = "/home/tyf/Project/Tantic/raw_feature/stgc_sp_all_class_tls_2"
+    root_dir = "/home/tyf/Project/Tantic/raw_feature/stgc_sp_all_class_tls_3"
     num_classes = 17 if "all_class" in root_dir else 14
     test_dataset_ratio = 0.2
     p_ratio = 0.99
@@ -540,17 +541,42 @@ if __name__ == "__main__":
     input_dim, seq_len = dataset[0][0].shape[1], dataset[0][0].shape[0]
     print(f"Input dimension: {input_dim}, Sequence length: {seq_len}")
 
-    total_samples = len(dataset)
-    n_val = int(total_samples * test_dataset_ratio)
-    n_train = total_samples - n_val
+    if os.path.exists(f"{root_dir}/train_idx.npy") and os.path.exists(
+        f"{root_dir}/val_idx.npy"
+    ):
+        train_idx = np.load(f"{root_dir}/train_idx.npy")
+        val_idx = np.load(f"{root_dir}/val_idx.npy")
+        print(f"split config load from disk, no re-generate")
+    else:
+        labels = np.array([data.y.item() for data in dataset])
+        idx = np.arange(len(dataset))
+        train_idx, val_idx = train_test_split(
+            idx, test_size=test_dataset_ratio, random_state=42, stratify=labels
+        )
+        # 保存
+        np.save(f"{root_dir}/train_idx.npy", train_idx)
+        np.save(f"{root_dir}/val_idx.npy", val_idx)
 
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [n_train, n_val], generator=torch.Generator().manual_seed(42)
-    )
+    # 使用
+    train_dataset = torch.utils.data.Subset(dataset, train_idx)
+    val_dataset = torch.utils.data.Subset(dataset, val_idx)
+
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=128, shuffle=True
+        train_dataset,
+        batch_size=128,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        prefetch_factor=2,
     )
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=128, shuffle=False)
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=128,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        prefetch_factor=2,
+    )
 
     model = train_cnn(
         search_lr=1e-3, dropout_param=0.1, search_hidden_dim=64, search_pooling="max"

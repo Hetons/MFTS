@@ -24,7 +24,8 @@ def initialize_logging():
 # 远程数据存放路径
 REMOTE_RAW_DATA_DIR = "/home/tyf/fnnas/Study/Traffic-data/train_raw_data"
 # 存储预处理后特征的路径
-PRODUCT_OUTPUT_DIR = f"/home/tyf/Project/Tantic/raw_feature/tatic_all_class"
+PRODUCT_OUTPUT_DIR = f"/home/tyf/Project/Tantic/raw_feature/stgc_fc_all_class_tls"
+
 
 # Cumul 数据集构建
 def collect_cumul():
@@ -40,7 +41,7 @@ def collect_cumul():
 
 
 # Tantic 数据集构建
-def collect_tantic():
+def collect_mmwf_ts():
     # 样本维度   # 每个图的节点数,流数量
     FLOW_NUM_PADDING = 32
     # 默认前 20 个包
@@ -52,14 +53,16 @@ def collect_tantic():
     # 每个 shard 包含的样本数
     SHARD_SIZE = 50000
     # support : fully_connected | time_threshold | spatio_temporal
-    EDGE_BUILD_METHOD = "spatio_temporal"
-
+    EDGE_BUILD_METHOD = "fully_connected"
+    # 流簇时间间隔
+    FLOW_CLUSTER_TIME_WINDOW = 0.15
     # 1) initialize collector
     collector = STGCGraphTensorCollector(
         sample_file_dir=REMOTE_RAW_DATA_DIR,
         num_flow_padding=FLOW_NUM_PADDING,
         num_packet_padding=PACKET_NUM_PADDING,
         edge_build_method=EDGE_BUILD_METHOD,
+        flow_cluster_time_window=FLOW_CLUSTER_TIME_WINDOW,
         tls_node_padding=TLS_NODE_PADDING,
         tls_threshold=TLS_THRESHOLD,
     )
@@ -98,9 +101,10 @@ if __name__ == "__main__":
 
     # collect cumul features
     # collect_cumul()
-    # collect tantic features
-    # collect_tantic()
-    collect_tatic()
+
+    # collect mmwf_ts features
+    collect_mmwf_ts()
+    # collect_tatic()
 
     # 2) log
     logging.info("Dataset preprocessing completed.")

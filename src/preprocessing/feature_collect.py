@@ -3,11 +3,10 @@ import os
 from struct import pack
 import numpy as np
 from typing_extensions import override
-from const import *
 from flow_extract import build_vaild_flow_ids, extract_flows
 from tls_exact import encode_tls_features
 from itertools import permutations
-from util import pad_trunc_1d
+from util import pad_trunc_1d, stats_18
 import math
 import logging
 
@@ -33,7 +32,7 @@ class EdgeIndexBuilder:
         elif method == "spatio_temporal":
             self.undirected = False  # 强制设为有向图
             edge_index, edge_attr = self.__build_edges_spatio_temporal(
-                threshold=kwargs.get("threshold", 1.0)
+                threshold=kwargs.get("threshold", 0.3)
             )
         else:
             raise ValueError(f"Unknown edge building method: {method}")
@@ -64,8 +63,12 @@ class EdgeIndexBuilder:
             [flow.get("dst_ip", "") for flow in self.flows],
             dtype=np.str_,
         )
+        # check cidr /24 相同
+        check_dst = (
+            lambda i, j: dst_ip[i].rsplit(".", 1)[0] == dst_ip[j].rsplit(".", 1)[0]
+        )
         build_edge_attr = lambda i, j: [
-            float(dst_ip[j] == dst_ip[i]),
+            float(dst_ip[j] == dst_ip[i] or check_dst(i, j)),
             math.exp(-abs(start_times[j] - start_times[i])),
         ]
         src, dst = [], []
@@ -223,9 +226,8 @@ class TaticTensorCollector(TensorCollector):
             if len(packet_times[i]) > 1:
                 packet_diff_times = [0.0] + np.diff(packet_times[i]).tolist()
             else:
-                packet_diff_times = [0.0] * (
-                    len(packet_times[i]) if len(packet_times[i]) > 0 else 1
-                )
+                # For 0 or 1 packets, the time diff sequence is padded with zeros later.
+                packet_diff_times = [0.0] * len(packet_times[i])
 
             packet_times_diff = pad_trunc_1d(
                 packet_diff_times, packet_nums_padding, pad_value=0.0
@@ -314,6 +316,7 @@ class GraphTensorCollector(TensorCollector):
         num_flow_padding: int = 32,  # flow num padding
         num_packet_padding: int = 128,  # packet num padding
         edge_build_method: str = "spatio_temporal",  # edge building method
+        flow_cluster_time_window=0.3, # flow cluster time window
         tls_node_padding: int = 8,  # number of TLS nodes
         tls_threshold: float = 0.3,  # time threshold, only get [flow_start_time, flow_start_time + threshold] flows for TLS feature
     ):
@@ -323,6 +326,7 @@ class GraphTensorCollector(TensorCollector):
         self.edge_build_method = edge_build_method
         self.tls_node_padding = tls_node_padding
         self.tls_threshold = tls_threshold
+        self.flow_cluster_time_window = flow_cluster_time_window
 
     def _output_node_feature_dimension(self) -> int:
         raise NotImplementedError
@@ -332,6 +336,7 @@ class GraphTensorCollector(TensorCollector):
         flows: dict,
         flows_nums_padding: int,
         packet_nums_padding: int,
+        flow_cluster_time_window: float,
         website_id: int,
     ) -> tuple[list, list, list, list]:
         """
@@ -355,6 +360,7 @@ class GraphTensorCollector(TensorCollector):
                 "collector_num_packet_padding": self.expected_packet_length,
                 "collector_edge_build_method": self.edge_build_method,
                 "collector_node_feature_dim": self._output_node_feature_dimension(),
+                "collector_flow_cluster_time_window": self.flow_cluster_time_window,
                 "collector_tls_node_padding": self.tls_node_padding,
                 "collector_tls_threshold": self.tls_threshold,
             }
@@ -421,6 +427,7 @@ class GraphTensorCollector(TensorCollector):
                     flows,
                     self.expected_num_flows,
                     self.expected_packet_length,
+                    self.flow_cluster_time_window,
                     website_idx,
                 )
 
@@ -550,6 +557,7 @@ class STGCGraphTensorCollector(GraphTensorCollector):
         flows: dict,
         flows_nums_padding: int,
         packet_nums_padding: int,
+        flow_cluster_time_window: float,
         website_id: int,
     ) -> tuple[list, list, list, list]:
         M = flows_nums_padding
@@ -615,7 +623,9 @@ class STGCGraphTensorCollector(GraphTensorCollector):
             method=self.edge_build_method,
         )
 
-        edge_index, edge_attr = edge_builder.build_edges(threshold=0.3)
+        edge_index, edge_attr = edge_builder.build_edges(
+            threshold=flow_cluster_time_window
+        )
 
         Y = np.array([website_id], dtype=np.int64)  # 从 0 开始编号
 
