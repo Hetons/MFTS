@@ -102,6 +102,13 @@ def get_payload_length(packet):
     return 0  # Return 0 if no payload exists
 
 
+# Helper function to extract TCP window size
+def get_window_size(packet):
+    if TCP in packet:
+        return int(packet[TCP].window)
+    return 0
+
+
 # Helper function to determine if a packet is uplink or downlink
 def is_uplink(packet, flow_id):
     src_ip, src_port, dst_ip, dst_port = flow_id
@@ -291,6 +298,10 @@ def extract_flows(
             if "payload_length" in extract_features:
                 flows[flow_id].setdefault("payload_length", []).append(
                     get_payload_length(packet)
+                )
+            if "window_size" in extract_features:
+                flows[flow_id].setdefault("window_size", []).append(
+                    get_window_size(packet)
                 )
             if "direction" in extract_features:
                 flows[flow_id].setdefault("direction", []).append(
