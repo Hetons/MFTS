@@ -10,7 +10,7 @@
 
 - [项目简介](#项目简介)
 - [方法说明](#方法说明)
-  - [本文方法 (Tantic)](#本文方法-tantic)
+  - [本文方法 (MFTS)](#本文方法-mfts)
   - [对比实验方法](#对比实验方法)
 - [目录结构](#目录结构)
 - [环境依赖](#环境依赖)
@@ -28,31 +28,39 @@ Tantic 是一个基于 TLS (Transport Layer Security) 协议特征的加密流�
 
 ## 方法说明
 
-### 本文方法 (Tantic)
+### 本文方法 (MFTS)
 
-Tantic 是基于 TLS 握手协议特征和图神经网络的流量分类方法，主要创新点包括：
+**MFTS (Multi-Feature Time Series)** 是本项目提出的基于多特征融合的加密流量分类方法，主要创新点包括：
 
-1. **TLS 特征提取**：从 TLS 握手过程中提取丰富的协议字段特征
-   - TLS 版本、长度、密码套件
-   - ClientHello/ServerHello 字段统计特征
-   - 扩展字段类型和长度分布
-   - 统计特征包括：min, max, mean, mad, std, var, skew, kurt, 分位数 (p10-p90), count
+1. **多模态特征提取**：
+   - **TLS 协议特征**：从 TLS 握手过程中提取协议字段特征
+     - TLS 版本、长度、密码套件
+     - ClientHello/ServerHello 字段统计特征
+     - Certificate、Server Key Exchange 等字段
+     - 扩展字段类型和长度分布
+     - 统计特征包括：min, max, mean, mad, std, var, skew, kurt, 分位数 (p10-p90), count
+   - **Payload 载荷特征**：构建基于图的流量表示
+     - 节点：数据包及其特征
+     - 边：数据包之间的时序关系和属性
+     - 利用图神经网络捕获数据包间的空间关系
 
-2. **图结构建模**：将流量数据构建为图结构
-   - 节点：TLS 数据包及其特征
-   - 边：数据包之间的时序关系
-   - 利用图神经网络捕获数据包间的关联
+2. **分层融合架构**：
+   - **Early Model** (`mfts_early_model.py`)：TLS 头部特征的快速分类
+     - 基于 TLS 协议特征的轻量级分类器
+     - 用于快速识别高置信度样本
+   - **Refine Model** (`mfts_refine_model.py`)：Payload 图特征的精细化分类
+     - 基于图注意力网络 (GAT) 的深度模型
+     - 处理需要更复杂特征的样本
+   - **Fusion Model** (`fusion_model.py`)：两阶段智能融合
+     - 首先使用 TLS 特征进行快速判断
+     - 对低置信度样本使用 Payload 图特征进行精化
+     - 自适应融合策略提升分类准确率
 
-3. **多模态特征融合**：
-   - 结合时序特征和协议特征
-   - 使用注意力机制进行特征融合
-   - 支持分类特征和数值特征的联合建模
-
-4. **模型架构**：
-   - Embedding层：处理分类特征（TLS版本、密码套件等）
-   - 图卷积层：捕获数据包间的空间关系
-   - 注意力层：自适应特征权重学习
-   - 分类层：多分类输出
+3. **模型特点**：
+   - 结合协议特征和载荷特征的互补优势
+   - 分层处理策略平衡准确率和效率
+   - 图神经网络捕获数据包间的复杂关联
+   - 支持分类特征（Embedding）和数值特征的联合建模
 
 ### 对比实验方法
 
@@ -78,16 +86,7 @@ Tantic 是基于 TLS 握手协议特征和图神经网络的流量分类方法�
 - **特征格式**：`[packet_length, window_size, time_interval]` 的序列
 - **模型**：基于注意力机制的神经网络
 
-#### 3. **MFTS** (Multi-Feature Time Series)
-- **位置**：`src/models/mfts/`
-- **原理**：基于多特征时间序列的流量分类方法
-- **实现**：
-  - `mfts_early_model.py`：早期融合模型
-  - `mfts_refine_model.py`：精化模型
-  - `fusion_model.py`：特征融合模型
-- **特点**：结合多种时序特征进行分类
-
-#### 4. **STC-WF** (Spatio-Temporal Convolution for Website Fingerprinting)
+#### 3. **STC-WF** (Spatio-Temporal Convolution for Website Fingerprinting)
 - **位置**：`src/models/stc-wf/`
 - **原理**：基于时空卷积的网站指纹识别
 - **特点**：利用卷积神经网络提取时空特征
@@ -113,20 +112,20 @@ Tantic/
 │   │   ├── util.py              # 工具函数
 │   │   └── ...
 │   └── models/                  # 模型实现
-│       ├── cumul/               # CUMUL方法
+│       ├── mfts/                # MFTS方法（本文方法）
+│       │   ├── mfts_early_model.py   # TLS特征快速分类
+│       │   ├── mfts_refine_model.py  # Payload图特征精化分类
+│       │   └── fusion_model.py       # 两阶段融合模型
+│       ├── cumul/               # CUMUL方法（对比基线）
 │       │   └── cumul.py
-│       ├── tatic/               # TaTic方法
+│       ├── tatic/               # TaTic方法（对比基线）
 │       │   ├── README.md
 │       │   ├── 01_easy_flow_modeling/    # 简单流建模
 │       │   ├── 02_hard_flow_modeling/    # 困难流建模
 │       │   ├── 03_easy-hard_classification/  # 分类器
 │       │   ├── needdata/        # 训练所需数据
 │       │   └── save_models/     # 保存的模型
-│       ├── mfts/                # MFTS方法
-│       │   ├── mfts_early_model.py
-│       │   ├── mfts_refine_model.py
-│       │   └── fusion_model.py
-│       └── stc-wf/              # STC-WF方法
+│       └── stc-wf/              # STC-WF方法（对比基线）
 │           └── model.py
 ├── raw_data_demo.json           # 原始数据示例
 ├── training_results.db          # 训练结果数据库
@@ -226,9 +225,21 @@ python -m src.preprocessing.tls_exact --input <flow_data> --output <tls_features
 
 ### 2. 模型训练
 
-**训练 Tantic 模型**：
+**训练 MFTS 模型（本文方法）**：
 ```bash
 jupyter notebook notebooks/train.ipynb
+```
+
+或分别训练各个模块：
+```bash
+# TLS Early Model
+python src/models/mfts/mfts_early_model.py
+
+# Payload Refine Model
+python src/models/mfts/mfts_refine_model.py
+
+# Fusion Model
+python src/models/mfts/fusion_model.py
 ```
 
 **训练对比方法**：
@@ -243,8 +254,8 @@ python 01_easy_flow_modeling/main.py
 python 02_hard_flow_modeling/main.py
 python 03_easy-hard_classification/main.py
 
-# MFTS
-python src/models/mfts/mfts_early_model.py
+# STC-WF
+python src/models/stc-wf/model.py
 ```
 
 ### 3. 数据格式
