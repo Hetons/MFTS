@@ -216,6 +216,6 @@ if __name__ == "__main__":
         )
 
     # save y_pred and y_true for further analysis
-    os.mkdir(f"{root_dir}/result")
+    os.makedirs(f"{root_dir}/result", exist_ok=True)
     np.save(f"{root_dir}/result/fusion_y_true.npy", fusion_trues)
     np.save(f"{root_dir}/result/fusion_y_pred.npy", fusion_preds)
