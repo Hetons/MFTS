@@ -30,7 +30,7 @@ Tantic 是一个基于 TLS (Transport Layer Security) 协议特征的加密流�
 
 ### 本文方法 (MFTS)
 
-**MFTS (Multi-Feature Time Series)** 是本项目提出的基于多特征融合的加密流量分类方法，主要创新点包括：
+**MFTS (Multi Flow Two stage)** 是本项目提出的基于多流两阶段融合的加密流量分类方法，主要创新点包括：
 
 1. **多模态特征提取**：
    - **TLS 协议特征**：从 TLS 握手过程中提取协议字段特征
