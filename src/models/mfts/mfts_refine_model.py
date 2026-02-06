@@ -345,7 +345,6 @@ def train_and_save_model(root: str, open_save: bool = False, save_path: str = ""
 
     # save model
     if open_save:
-        save_path = save_path
         torch.save(
             {
                 "model_state_dict": best_state_dict,

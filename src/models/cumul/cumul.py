@@ -199,6 +199,7 @@ def train_cumul_torch_with_loader(
             f"Epoch {epoch:02d} | loss={train_loss:.4f} | train_acc={train_acc:.4f} | val_acc={val_acc:.4f}"
         )
 
+    print(f"Parameters size: {sum(p.numel() for p in model.parameters())}")
     if best_state is not None:
         model.load_state_dict(best_state)
     return best_val_acc, best_report

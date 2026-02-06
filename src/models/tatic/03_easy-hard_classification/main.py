@@ -31,7 +31,7 @@ def get_args():
         "-model_name",
         metavar="INPUT",
         type=str,
-        default="/home/tyf/Project/Tantic/src/models/tatic-main/save_models/in_channel_64-in_kernel_64-layers_4-seq_len_16-ker_size_13-fold_0.pth",
+        default="/home/tyf/Project/Tantic/src/models/tatic/save_models/in_channel_64-in_kernel_64-layers_4-seq_len_16-ker_size_13-fold_0.pth",
     )
     parser.add_argument(
         "-input_name",
@@ -244,7 +244,7 @@ def test(model, device, test_loader, i, loss_fn):
 
 
 if __name__ == "__main__":
-    file_dir = "/home/tyf/Project/Tantic/src/models/tatic-main/needdata/"
+    file_dir = "/home/tyf/Project/Tantic/src/models/tatic/needdata/"
     valid_data, valid_labels, test_data, test_labels = read_data(file_dir, seq_leng)
     os.environ["CUDA_VISIBLE_DEVICES"] = CUDA_VISIBLE_DEVICES
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
