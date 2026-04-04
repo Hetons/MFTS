@@ -205,15 +205,17 @@ class TaticTensorCollector(TensorCollector):
         flows: dict,
         packet_nums_padding: int,
         website_id: int,
-    ) -> tuple[list, list]:
+    ) -> tuple[list, list, list]:
         flow_nums = len(flows)
         # 提取每个流的包长序列
         packet_lengths = [flow.get("packet_length", []) for flow in flows.values()]
         packet_window_size = [flow.get("window_size", []) for flow in flows.values()]
         packet_times = [flow.get("timestamp", []) for flow in flows.values()]
+        flow_start_times = [flow.get("flow_start_time", 0.0) for flow in flows.values()]
         # packet times, diff with previous packet
 
         X_i = []
+        T_i = []
         for i in range(flow_nums):
             pkt_len_seq = pad_trunc_1d(
                 packet_lengths[i], packet_nums_padding, pad_value=0.0
@@ -240,10 +242,10 @@ class TaticTensorCollector(TensorCollector):
             interleaved = stacked.flatten()  # 形状: (3*packet_nums_padding,)
 
             X_i.append(interleaved.tolist())  # ✓ 转换为 list 保持一致性
-
+            T_i.append(flow_start_times[i])  # ✓ 使用实际的 flow_start_time 作为 T_i
         # ✓ 使用实际处理后的数量
         Y_i = len(X_i) * [website_id]
-        return X_i, Y_i
+        return X_i, T_i, Y_i
 
     @override
     def sample_iter(self):
@@ -283,6 +285,7 @@ class TaticTensorCollector(TensorCollector):
                         "packet_length",
                         "timestamp",
                         "window_size",
+                        "flow_start_time",
                     ],
                     vaild_flow_ids=vaild_flow_ids,
                 )
@@ -290,7 +293,7 @@ class TaticTensorCollector(TensorCollector):
                 if len(flows) == 0:
                     continue
 
-                X_i, y_i = self._do_collect(
+                X_i, T_i, y_i = self._do_collect(
                     flows,
                     self.packet_nums_padding,
                     website_idx,
@@ -306,7 +309,7 @@ class TaticTensorCollector(TensorCollector):
                         f"Processed {idx} instances, now processing for website {website_name}"
                     )
 
-                yield instance_id, X_i, y_i
+                yield instance_id, X_i, T_i, y_i
 
 
 class GraphTensorCollector(TensorCollector):

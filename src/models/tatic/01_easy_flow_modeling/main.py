@@ -1,6 +1,7 @@
 import csv
 import random
 import argparse
+import time
 from collections import Counter
 
 import numpy as np
@@ -236,7 +237,7 @@ def main_fun(file_dir, num_packs, fold_num, criterion, num_trees, condition, fol
     train_x, train_y, valid_x, valid_y, test_x, test_y = format_division(
         short_text, fold_num
     )
-
+    start_time = time.time()
     need_again_id, valid_Tag, test_Tag, easy_flow_test = build_tree_up_to_down(
         train_x,
         np.array(np.array(np.array(train_y))[:, 0], "int32"),
@@ -251,7 +252,7 @@ def main_fun(file_dir, num_packs, fold_num, criterion, num_trees, condition, fol
         criterion,
         num_trees,
     )
-
+    print("Fold {} total time: {:.2f} seconds".format(fold, time.time() - start_time))
     with open(
         "./needdata/{}_valid_pre_true.csv".format(out_name), "w", newline=""
     ) as f:
@@ -333,4 +334,4 @@ if __name__ == "__main__":
         long_text=long_text, id_valid_test=id_valid_test, seq_leng=seq_leng
     )
 
-    save_need(need_data)
+    # save_need(need_data)

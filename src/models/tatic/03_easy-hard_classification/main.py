@@ -12,6 +12,24 @@ from sklearn.metrics import balanced_accuracy_score, confusion_matrix
 from model1 import TCN
 from Mydataset import Mydataset
 import Get_filename_1 as GF
+from sklearn.metrics import classification_report
+from util import profile_model_inference
+
+
+def print_profile_metrics(title: str, metrics: dict):
+    print(f"\n=== {title} Inference Profile ===")
+    print(f"Device: {metrics['device']}")
+    print(f"Model param device: {metrics['model_param_device']}")
+    print(f"Input device: {metrics['input_device']}")
+    print(f"Batch size: {metrics['batch_size']}")
+    print(f"Params: {metrics['params']:,}")
+    print(f"MACs/sample: {metrics['macs_per_sample']:.2f}")
+    print(f"FLOPs/sample: {metrics['flops_per_sample']:.2f}")
+    print(f"MACs/batch: {metrics['macs_per_batch']}")
+    print(f"FLOPs/batch: {metrics['flops_per_batch']}")
+    print(f"Avg batch latency: {metrics['avg_batch_latency_ms']:.4f} ms")
+    print(f"Avg sample latency: {metrics['avg_sample_latency_ms']:.6f} ms")
+    print(f"Throughput: {metrics['throughput_samples_per_s']:.2f} samples/s")
 
 
 def get_args():
@@ -22,7 +40,7 @@ def get_args():
     parser.add_argument("-input_channel", metavar="INPUT", type=int, default=64)
     parser.add_argument("-in_ker_num", metavar="INPUT", type=int, default=64)
     parser.add_argument("-layers", metavar="INPUT", type=int, default=4)
-    parser.add_argument("-seq_len", metavar="INPUT", type=int, default=32)
+    parser.add_argument("-seq_len", metavar="INPUT", type=int, default=16)
     parser.add_argument("-ker_size", metavar="INPUT", type=int, default=13)
     parser.add_argument("-fold", metavar="INPUT", type=int, default=0)
     parser.add_argument("-CUDA", metavar="INPUT", type=str, default="0")
@@ -43,7 +61,7 @@ def get_args():
 
 
 args = get_args()
-output_size = 28
+output_size = 17
 max_words = 10000
 dropout = 0.35
 save_dir = "./save_models/"
@@ -96,10 +114,7 @@ def read_data(file_dir, seq_leng):
             break
         temp1 = []
         for i in range(seq_leng):
-            if int(e1[3 * i]) < 0:
-                temp1.append(0)
-            else:
-                temp1.append(int(e1[3 * i]))
+            temp1.append(abs(int(e1[3 * i])))
         valid_data.append(temp1)
         valid_labels.append(int(birth_data3[1][id1]))
     temp_test_data = np.array(birth_data3)[2]
@@ -110,12 +125,11 @@ def read_data(file_dir, seq_leng):
             break
         temp1 = []
         for i in range(seq_leng):
-            if int(e1[3 * i]) < 0:
-                temp1.append(0)
-            else:
-                temp1.append(int(e1[3 * i]))
+            temp1.append(abs(int(e1[3 * i])))
         test_data.append(temp1)
         test_labels.append(int(birth_data3[3][id2]))
+
+    # print(test_data)
     return valid_data, valid_labels, test_data, test_labels
 
 
@@ -183,6 +197,11 @@ def valid(model, device, valid_loader, i, loss_fn):
         valid_acc = 100.0 * acc
         y_true_trans1 = np.array(y_true_list + list(valid_true_labels))
         y_predict_trans1 = np.array(y_predict_list + list(valid_pre_labels))
+        # sklearn report
+        print(
+            "Classification Report:\n",
+            classification_report(y_true_trans1, y_predict_trans1, digits=4),
+        )
         acc1 = balanced_accuracy_score(y_true_trans1, y_predict_trans1)
         valid_acc1 = 100.0 * acc1
     print("Testing fold {} loss:{:.4f}, acc:{:.4f}".format(i, avg_loss, valid_acc))
@@ -191,6 +210,9 @@ def valid(model, device, valid_loader, i, loss_fn):
             i, avg_loss, valid_acc1
         )
     )
+    # print model size
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total number of parameters: {total_params}")
     print("---------------------------------------------------")
 
 
@@ -249,6 +271,17 @@ if __name__ == "__main__":
     os.environ["CUDA_VISIBLE_DEVICES"] = CUDA_VISIBLE_DEVICES
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    print("=== Runtime Device Check ===")
+    print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', '')}")
+    print(f"torch.cuda.is_available(): {torch.cuda.is_available()}")
+    print(f"selected device: {device}")
+    if torch.cuda.is_available():
+        print(f"torch.cuda.device_count(): {torch.cuda.device_count()}")
+        print(f"torch.cuda.current_device(): {torch.cuda.current_device()}")
+        print(
+            f"torch.cuda.get_device_name(): {torch.cuda.get_device_name(torch.cuda.current_device())}"
+        )
+
     dataload = data_load(valid_data, valid_labels, test_data, test_labels, seq_leng)
     dataload = np.squeeze(dataload)
 
@@ -262,9 +295,20 @@ if __name__ == "__main__":
         seq_leng=seq_leng,
     ).to(device)
 
-    model.load_state_dict(torch.load(outname, map_location=torch.device("cpu")))
+    model.load_state_dict(torch.load(outname, map_location=device))
+    print(f"model parameter device: {next(model.parameters()).device}")
 
     criterion = torch.nn.CrossEntropyLoss()
+
+    # 使用 valid loader 做统一口径性能评估
+    profile_metrics = profile_model_inference(
+        model=model,
+        data_loader=dataload[0],
+        device=str(device),
+        warmup_steps=20,
+        measure_steps=100,
+    )
+    print_profile_metrics("TATIC", profile_metrics)
 
     valid(model, device, dataload[0], fold, criterion)
     test(model, device, dataload[1], fold, criterion)

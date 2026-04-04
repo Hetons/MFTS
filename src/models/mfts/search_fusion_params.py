@@ -18,8 +18,8 @@ val_loader = PyGDataLoader(val_dataset, batch_size=512, shuffle=False)
 
 model = FusionModel(
     quick_ratio=0.95,  # 会被覆盖
-    tls_model_path="/home/tyf/Project/Tantic/checkpoints/fast_tls_cnn.pth",
-    payload_model_path="/home/tyf/Project/Tantic/checkpoints/payload_gnn_model.pth",
+    tls_model_path="/home/tyf/Project/Tantic/checkpoints/mfts_fast_tls_cnn.pth",
+    payload_model_path="/home/tyf/Project/Tantic/checkpoints/mfts_payload_gnn_model.pth",
 )
 
 # 预先计算所有预测（避免重复推理）

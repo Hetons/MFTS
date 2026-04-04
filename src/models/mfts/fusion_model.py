@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import os
 import numpy as np
+from typing import Any, cast
 from sklearn.metrics import classification_report
 from torch.utils.data import Dataset
 from torch_geometric.loader import DataLoader as PyGDataLoader
@@ -13,6 +14,7 @@ from mfts_early_model import (
     MftsEarlyModel,
     ShardedGraphDataset as TlsShardedGraphDataset,
 )
+from util import profile_model_inference
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -75,21 +77,87 @@ class FusionModel(nn.Module):
         return tls_model, payload_model
 
 
+class ValLoaderView:
+    def __init__(self, base_loader, branch: str):
+        self.base_loader = base_loader
+        self.branch = branch
+
+    def __iter__(self):
+        for batch_payload, batch_tls, batch_y in self.base_loader:
+            if self.branch == "tls":
+                yield batch_tls, batch_y
+            elif self.branch == "payload":
+                yield batch_payload, batch_y
+            else:
+                raise ValueError(f"Unknown branch: {self.branch}")
+
+    def __len__(self):
+        return len(self.base_loader)
+
+
+class PayloadForwardWrapper(nn.Module):
+    def __init__(self, payload_model: nn.Module):
+        super().__init__()
+        self.payload_model = payload_model
+
+    def forward(self, payload_batch):
+        return self.payload_model(
+            payload_batch.x,
+            payload_batch.edge_index,
+            payload_batch.edge_attr,
+            payload_batch.batch,
+        )
+
+
+def print_profile_metrics(title: str, metrics: dict):
+    print(f"\n=== {title} Inference Profile ===")
+    print(f"Device: {metrics['device']}")
+    print(f"Batch size: {metrics['batch_size']}")
+    print(f"Params: {metrics['params']:,}")
+    print(f"MACs/sample: {metrics['macs_per_sample']:.2f}")
+    print(f"FLOPs/sample: {metrics['flops_per_sample']:.2f}")
+    print(f"Avg batch latency: {metrics['avg_batch_latency_ms']:.4f} ms")
+    print(f"Avg sample latency: {metrics['avg_sample_latency_ms']:.6f} ms")
+    print(f"Throughput: {metrics['throughput_samples_per_s']:.2f} samples/s")
+
+
 if __name__ == "__main__":
     root_dir = "/home/tyf/Project/Tantic/raw_feature/stgc_sp_all_class_tls_3"
 
     dataset = FusionModelDataset(root_dir=root_dir, num_classes=17)
     val_idx = np.load(f"{root_dir}/val_idx.npy")
     val_dataset = torch.utils.data.Subset(dataset, val_idx)
-    val_loader = PyGDataLoader(val_dataset, batch_size=512, shuffle=False)
+    val_loader = PyGDataLoader(cast(Any, val_dataset), batch_size=512, shuffle=False)
 
     print(f"Validation set: {len(val_dataset)} samples")
 
     model = FusionModel(
         quick_ratio=0.99,
-        tls_model_path="/home/tyf/Project/Tantic/checkpoints/fast_tls_cnn.pth",
-        payload_model_path="/home/tyf/Project/Tantic/checkpoints/payload_gnn_model.pth",
+        tls_model_path="/home/tyf/Project/Tantic/checkpoints/mfts_fast_tls_cnn.pth",
+        payload_model_path="/home/tyf/Project/Tantic/checkpoints/mfts_payload_gnn_model.pth",
     )
+
+    # ==================== 性能评估（基于 val_loader） ====================
+    tls_profile_loader = ValLoaderView(val_loader, branch="tls")
+    payload_profile_loader = ValLoaderView(val_loader, branch="payload")
+
+    tls_profile = profile_model_inference(
+        model=model.tls_model,
+        data_loader=cast(Any, tls_profile_loader),
+        device=str(device),
+        warmup_steps=20,
+        measure_steps=100,
+    )
+    print_profile_metrics("TLS-only", tls_profile)
+
+    payload_profile = profile_model_inference(
+        model=PayloadForwardWrapper(model.payload_model),
+        data_loader=cast(Any, payload_profile_loader),
+        device=str(device),
+        warmup_steps=20,
+        measure_steps=100,
+    )
+    print_profile_metrics("Payload-only", payload_profile)
 
     # ==================== Payload-only 评估 ====================
     print("\n=== Payload-only Evaluation ===")
@@ -173,7 +241,7 @@ if __name__ == "__main__":
                 )
                 payload_probs = torch.softmax(payload_pred, dim=1)
                 fused_probs = (
-                    0.6 * payload_probs[~quick_mask] + 0.4 * tls_probs[~quick_mask]
+                    0.5 * payload_probs[~quick_mask] + 0.5 * tls_probs[~quick_mask]
                 )
                 final_pred[~quick_mask] = fused_probs.argmax(dim=1)
 

@@ -3,7 +3,8 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
-
+import time
+from util import profile_model_inference
 
 def cumulate_features(p_seq, n=100):
     """
@@ -97,6 +98,8 @@ class MinMaxScalerToMinusOneOne:
 
     def transform(self, X):
         X = np.asarray(X, dtype=np.float32)
+        if self.min_ is None or self.max_ is None:
+            raise ValueError("Scaler 尚未 fit，请先调用 fit 或 fit_transform")
         denom = np.maximum(self.max_ - self.min_, self.eps)
         x01 = (X - self.min_) / denom
         return (2.0 * x01 - 1.0).astype(np.float32)
@@ -149,6 +152,9 @@ def train_cumul_torch_with_loader(
     dropout=0.1,
     hidden=256,
     device=None,
+    profile_inference=True,
+    profile_warmup_steps=20,
+    profile_measure_steps=100,
 ):
     """使用已创建好的 DataLoader 进行训练（用于超参数搜索）"""
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -164,6 +170,7 @@ def train_cumul_torch_with_loader(
     best_val_acc = 0.0
     best_state = None
     best_report = None
+    start_time = time.time()
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss, correct, total = 0.0, 0, 0
@@ -195,13 +202,41 @@ def train_cumul_torch_with_loader(
             }
             best_report = val_report
 
-        print(
-            f"Epoch {epoch:02d} | loss={train_loss:.4f} | train_acc={train_acc:.4f} | val_acc={val_acc:.4f}"
-        )
+        # print(
+        #     f"Epoch {epoch:02d} | loss={train_loss:.4f} | train_acc={train_acc:.4f} | val_acc={val_acc:.4f}"
+        # )
 
+    print(f"Total training time: {time.time() - start_time:.2f}s")
     print(f"Parameters size: {sum(p.numel() for p in model.parameters())}")
     if best_state is not None:
         model.load_state_dict(best_state)
+
+    profile_metrics = None
+    if profile_inference:
+        profile_metrics = profile_model_inference(
+            model=model,
+            data_loader=val_loader,
+            device=device,
+            warmup_steps=profile_warmup_steps,
+            measure_steps=profile_measure_steps,
+        )
+        print("\n=== Inference Profile (Unified Protocol) ===")
+        print(f"Device: {profile_metrics['device']}")
+        print(f"Batch size: {profile_metrics['batch_size']}")
+        print(f"Params: {profile_metrics['params']:,}")
+        print(f"MACs/sample: {profile_metrics['macs_per_sample']:.2f}")
+        print(f"FLOPs/sample: {profile_metrics['flops_per_sample']:.2f}")
+        print(f"MACs/batch: {profile_metrics['macs_per_batch']}")
+        print(f"FLOPs/batch: {profile_metrics['flops_per_batch']}")
+        print(f"Avg batch latency: {profile_metrics['avg_batch_latency_ms']:.4f} ms")
+        print(f"Avg sample latency: {profile_metrics['avg_sample_latency_ms']:.6f} ms")
+        print(
+            f"Throughput: {profile_metrics['throughput_samples_per_s']:.2f} samples/s"
+        )
+        print(
+            f"Warmup/Measure steps: {profile_metrics['warmup_steps']}/{profile_metrics['measure_steps']}"
+        )
+
     return best_val_acc, best_report
 
 

@@ -1,5 +1,7 @@
 from ast import Tuple
 import os, glob
+from tracemalloc import start
+from typing import Any, cast
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -12,6 +14,8 @@ from torch_geometric.nn import (
     SAGPooling,
     global_mean_pool,
 )
+import time
+from util import profile_model_inference
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -191,7 +195,7 @@ class StcWfModel(torch.nn.Module):
         x, edge_index, _, batch, _, _ = self.sag_pooling(x, edge_index, None, batch)
         x = global_mean_pool(x, batch)
 
-        return self.mlp(x) 
+        return self.mlp(x)
 
 
 class Evaluator:
@@ -267,6 +271,41 @@ class Evaluator:
         return cm
 
 
+class ProfileLoaderView:
+    def __init__(self, base_loader):
+        self.base_loader = base_loader
+
+    def __iter__(self):
+        for batch in self.base_loader:
+            yield batch, batch.y
+
+    def __len__(self):
+        return len(self.base_loader)
+
+
+class ProfileForwardWrapper(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module):
+        super().__init__()
+        self.model = model
+
+    def forward(self, batch):
+        return self.model(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
+
+
+def print_profile_metrics(metrics: dict):
+    print("\n=== Inference Profile (utils.profile_model_inference) ===")
+    print(f"Device: {metrics['device']}")
+    print(f"Batch size: {metrics['batch_size']}")
+    print(f"Params: {metrics['params']:,}")
+    print(f"MACs/sample: {metrics['macs_per_sample']:.2f}")
+    print(f"FLOPs/sample: {metrics['flops_per_sample']:.2f}")
+    print(f"MACs/batch: {metrics['macs_per_batch']}")
+    print(f"FLOPs/batch: {metrics['flops_per_batch']}")
+    print(f"Avg batch latency: {metrics['avg_batch_latency_ms']:.4f} ms")
+    print(f"Avg sample latency: {metrics['avg_sample_latency_ms']:.6f} ms")
+    print(f"Throughput: {metrics['throughput_samples_per_s']:.2f} samples/s")
+
+
 def train_and_save_model(root: str, open_save: bool = False, save_path: str = ""):
     global best_acc_val, best_state_dict
     num_classes = 17
@@ -294,6 +333,7 @@ def train_and_save_model(root: str, open_save: bool = False, save_path: str = ""
     opt = torch.optim.Adam(model.parameters(), lr=search_lr)
     loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights)
     evaluator = Evaluator(model, val_loader, device=device, num_classes=num_classes)
+    start_time = time.time()
     for epoch in range(epochs):
         model.train()
         for _, batch in enumerate(train_loader):
@@ -307,7 +347,7 @@ def train_and_save_model(root: str, open_save: bool = False, save_path: str = ""
         if val_acc > best_acc_val:
             best_acc_val = val_acc
             best_state_dict = copy.deepcopy(model.state_dict())
-
+    print(f"Total training time: {time.time() - start_time:.2f}s")
     print(
         f"Best Validation Accuracy: {best_acc_val:.4f}, Total Parameters: {total_params}"
     )
@@ -335,7 +375,7 @@ def train_and_save_model(root: str, open_save: bool = False, save_path: str = ""
 
 if __name__ == "__main__":
     root = "/home/tyf/Project/Tantic/raw_feature/stgc_sp_all_class_tls_3"
-    model_save_path = "./checkpoints/payload_gnn_model.pth"
+    model_save_path = "./checkpoints/stc_wf_payload_gnn_model.pth"
     best_acc_val = float(0.0)
     best_state_dict = None
     loader_builder = DataLoaderBuilder(root, num_classes=17, batch_size=512)
@@ -358,6 +398,18 @@ if __name__ == "__main__":
         dropout_param=payload_model_check_point["config"]["dropout_param"],
     ).to(device)
     payload_model.load_state_dict(payload_model_check_point["model_state_dict"])
+
+    # 性能评估
+    profile_metrics = profile_model_inference(
+        model=ProfileForwardWrapper(payload_model),
+        data_loader=cast(Any, ProfileLoaderView(loader_builder.val_loader)),
+        device=str(device),
+        warmup_steps=20,
+        measure_steps=100,
+    )
+    print_profile_metrics(profile_metrics)
+
+    # 准确率评估
     evaluator = Evaluator(
         payload_model,
         loader_builder.val_loader,

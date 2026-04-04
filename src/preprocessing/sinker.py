@@ -56,10 +56,11 @@ def tatic_tensor_sinker(
 
     total_samples = 0
     with open(csv_path, "w", encoding="utf-8") as f:
-        for instance_id, X_i, y_i in sample_iter:
+        for instance_id, X_i, T_i, y_i in sample_iter:
             # X_i: List of interleaved flows, shape [num_flows, 3*num_packs]
+            # T_i: List of flow start times, shape [num_flows]
             # y_i: List of labels, shape [num_flows]
-            for flow_idx, (features, label) in enumerate(zip(X_i, y_i)):
+            for flow_idx, (features, flow_start_time, label) in enumerate(zip(X_i, T_i, y_i)):
                 # 构建标识符: 如 airbnb-01.txt_0
                 identifier = f"{instance_id}_{flow_idx}"
 
@@ -67,7 +68,7 @@ def tatic_tensor_sinker(
                 feature_str = str(features)
 
                 # 写入 CSV (手动构建以确保格式正确)
-                f.write(f'{identifier},"{feature_str}",{label}\n')
+                f.write(f'{identifier},"{feature_str}",{label},{flow_start_time}\n')
                 total_samples += 1
 
     # 保存元数据
@@ -119,7 +120,7 @@ def cumul_tensor_sinker(
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
 
-def tantic_tensor_sinker(
+def mfts_tensor_sinker(
     sample_iter: Iterable,
     out_dir: str,
     shard_size: int = 50000,
