@@ -4,9 +4,44 @@
 
 import torch
 import numpy as np
+import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score
 from torch_geometric.loader import DataLoader as PyGDataLoader
 from fusion_model import FusionModel, FusionModelDataset
+
+
+def plot_acc_by_payload_weight_at_best_qr(
+    grid_results, best_quick_ratio, payload_weights, save_path=None
+):
+    """固定最优 quick_ratio，绘制不同 payload_w 下的 Acc 曲线。"""
+    plt.figure(figsize=(10, 6), dpi=300)
+
+    acc_list = [grid_results[(best_quick_ratio, pw)] for pw in payload_weights]
+    plt.plot(
+        payload_weights,
+        acc_list,
+        marker="o",
+        linewidth=1.8,
+    )
+
+    plt.xlabel("MFTS-refine Fusion Weight")
+    plt.ylabel("Accuracy (Acc)")
+    plt.title(
+        f"Accuracy vs MFTS-refine Fusion Weight at Best quick_ratio={best_quick_ratio:.3f}"
+    )
+    plt.grid(True)
+    xticks = payload_weights[::5] if len(payload_weights) > 5 else payload_weights
+    if payload_weights[-1] not in xticks:
+        xticks = xticks + [payload_weights[-1]]
+    plt.xticks(xticks)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, format="svg", bbox_inches="tight")
+        print(f"\nSaved plot to: {save_path}")
+
+    plt.show()
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -54,7 +89,7 @@ print(f"Total samples: {len(all_y_true)}")
 
 # 网格搜索
 quick_ratios = [0.80, 0.85, 0.90, 0.95, 0.99, 0.995]
-payload_weights = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+payload_weights = np.round(np.arange(0.30, 0.801, 0.01), 2).tolist()
 
 print("\n" + "=" * 80)
 print("Grid Search: quick_ratio vs payload_weight")
@@ -66,6 +101,7 @@ print("-" * 80)
 
 best_acc = 0
 best_params = None
+grid_results = {}
 
 for qr in quick_ratios:
     for pw in payload_weights:
@@ -89,6 +125,7 @@ for qr in quick_ratios:
             final_pred[~quick_mask] = fused_probs.argmax(dim=1)
 
         acc = accuracy_score(all_y_true, final_pred.numpy())
+        grid_results[(qr, pw)] = acc
         quick_pct = quick_mask.sum().item() / len(all_y_true)
         gain = acc - 0.9819  # vs payload-only
 
@@ -111,3 +148,11 @@ payload_acc = accuracy_score(all_y_true, all_payload_probs.argmax(dim=1).numpy()
 print(f"TLS-only:     {tls_acc:.4f}")
 print(f"Payload-only: {payload_acc:.4f}")
 print(f"Best Fusion:  {best_acc:.4f}")
+
+# 固定最优 quick_ratio，绘制不同 payload_w 下的 Acc 率
+plot_acc_by_payload_weight_at_best_qr(
+    grid_results,
+    best_quick_ratio=best_params[0],
+    payload_weights=payload_weights,
+    save_path="/home/tyf/Project/Tantic/results/acc_vs_payload_w_best_qr.svg",
+)
