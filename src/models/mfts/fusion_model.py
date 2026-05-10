@@ -206,6 +206,9 @@ if __name__ == "__main__":
     print("\n=== Fusion Evaluation ===")
     fusion_preds, fusion_trues = [], []
     quick_selected, total_samples = 0, 0
+    quick_correct = 0
+    slow_correct = 0
+    slow_total = 0
 
     model.eval()
     with torch.no_grad():
@@ -245,8 +248,25 @@ if __name__ == "__main__":
                 )
                 final_pred[~quick_mask] = fused_probs.argmax(dim=1)
 
-            fusion_preds.append(final_pred.cpu())
+            final_pred_cpu = final_pred.cpu()
+            quick_mask_cpu = quick_mask.cpu()
+            slow_mask_cpu = ~quick_mask_cpu
+
+            fusion_preds.append(final_pred_cpu)
             fusion_trues.append(batch_y)
+            if quick_mask_cpu.any():
+                quick_correct += int(
+                    (final_pred_cpu[quick_mask_cpu] == batch_y[quick_mask_cpu])
+                    .sum()
+                    .item()
+                )
+            if slow_mask_cpu.any():
+                slow_total += int(slow_mask_cpu.sum().item())
+                slow_correct += int(
+                    (final_pred_cpu[slow_mask_cpu] == batch_y[slow_mask_cpu])
+                    .sum()
+                    .item()
+                )
 
     fusion_preds = torch.cat(fusion_preds).numpy()
     fusion_trues = torch.cat(fusion_trues).numpy()
@@ -269,14 +289,8 @@ if __name__ == "__main__":
     )
     print(f"Quick-branch coverage: {quick_selected/total_samples:.2%}")
 
-    # 分析快速/慢速分支的准确率
-    quick_correct = ((fusion_preds == fusion_trues) & (tls_preds == fusion_trues)).sum()
-    slow_mask_np = tls_preds != fusion_preds  # 走慢速分支的样本
-    slow_correct = ((fusion_preds == fusion_trues) & slow_mask_np).sum()
-    slow_total = slow_mask_np.sum()
-
     print(
-        f"\nQuick-branch accuracy: {quick_correct/quick_selected:.4f} (on {quick_selected} samples)"
+        f"\nQuick-branch accuracy: {quick_correct/max(quick_selected, 1):.4f} (on {quick_selected} samples)"
     )
     if slow_total > 0:
         print(

@@ -6,6 +6,28 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 
+def _infer_batch_size(x: Any) -> int:
+    if torch.is_tensor(x):
+        return int(x.size(0))
+
+    num_graphs = getattr(x, "num_graphs", None)
+    if num_graphs is not None:
+        return int(num_graphs)
+
+    batch_vec = getattr(x, "batch", None)
+    if torch.is_tensor(batch_vec) and batch_vec.numel() > 0:
+        return int(batch_vec.max().item()) + 1
+
+    x_tensor = getattr(x, "x", None)
+    if torch.is_tensor(x_tensor):
+        return int(x_tensor.size(0))
+
+    raise TypeError(
+        f"Unsupported input type for batch size inference: {type(x)!r}. "
+        "Expected a Tensor or a (PyG) batch-like object with num_graphs/batch/x."
+    )
+
+
 def profile_model_inference(
     model: nn.Module,
     data_loader: DataLoader,
@@ -30,9 +52,19 @@ def profile_model_inference(
     if first_batch is None:
         raise ValueError("data_loader 为空，无法进行推理性能评估")
 
-    x, _ = first_batch
+    if isinstance(first_batch, (tuple, list)):
+        x = first_batch[0]
+    else:
+        x = first_batch
+
+    if not hasattr(x, "to"):
+        raise TypeError(
+            f"Unsupported input type for inference profiling: {type(x)!r}. "
+            "Expected a Tensor or a batch-like object with a `.to(device)` method."
+        )
+
     x = x.to(run_device)
-    batch_size = int(x.size(0))
+    batch_size = _infer_batch_size(x)
 
     was_training = model.training
     model.eval()
