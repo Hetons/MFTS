@@ -8,10 +8,9 @@ from torch.nn import Softmax
 import os
 import numpy as np
 import glob
-import optuna
 import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
-
+import time
 # 指定 device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -502,7 +501,7 @@ def train_cnn(
     print("total parameters", total)
     optimizer = torch.optim.Adam(model.parameters(), lr=search_lr)
     criterion = nn.CrossEntropyLoss()
-
+    start_time = time.time()
     for epoch in range(50):
         model.train()
         total_loss = 0
@@ -514,6 +513,7 @@ def train_cnn(
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
+    print(f"Training completed in {time.time() - start_time:.2f}s")
     torch.save(
         {
             "model_state_dict": model.state_dict(),
@@ -526,7 +526,7 @@ def train_cnn(
                 "dropout_param": dropout_param,
             },
         },
-        f"{save_folder}/fast_tls_cnn.pth",
+        f"{save_folder}/mfts_fast_tls_cnn.pth",
     )
     return model
 

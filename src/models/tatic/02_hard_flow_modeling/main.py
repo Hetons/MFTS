@@ -1,6 +1,7 @@
 import os
 import random
 import argparse
+import time
 
 import numpy as np
 from sklearn.metrics import balanced_accuracy_score, confusion_matrix
@@ -39,7 +40,7 @@ def get_args():
 
 args = get_args()
 max_acc = 0
-output_size = 28
+output_size = 17
 
 dropout = 0.35
 save_dir = "./save_models/"
@@ -61,7 +62,7 @@ outname = args.model_name.format(
 )
 batch_size = args.batch_size
 
-file_dir = "/home/tyf/Project/Tantic/src/models/tatic-main/dataset"
+file_dir = "/home/tyf/Project/Tantic/raw_feature/tatic_all_class"
 data = DS.main(file_dir, num_packs)
 
 
@@ -293,6 +294,7 @@ if __name__ == "__main__":
         optimizer, "min", factor=0.1, patience=20, verbose=True, min_lr=1e-5
     )
     max_acc = 0
+    start_time = time.time()
     for epoch in range(num_epochs):
         train(model, device, dataload[0], optimizer, epoch, int(fold) + 1, criterion)
         valid_acc = valid(
@@ -308,4 +310,5 @@ if __name__ == "__main__":
         if max_acc < valid_acc:
             max_acc = valid_acc
             torch.save(model.state_dict(), save_dir + "{}.pth".format(outname))
+    print(f"Total training time: {time.time() - start_time:.2f}s")
     test(device, dataload[2], int(fold) + 1, criterion, save_dir, outname)

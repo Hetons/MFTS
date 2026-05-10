@@ -14,6 +14,7 @@ from torch_geometric.nn import (
     global_add_pool,
     global_max_pool,
 )
+import time
 from torch_geometric.nn import AttentionalAggregation
 
 from torch_geometric.nn import Set2Set
@@ -323,6 +324,7 @@ def train_and_save_model(root: str, open_save: bool = False, save_path: str = ""
     opt = torch.optim.Adam(model.parameters(), lr=search_lr)
     loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights)
     evaluator = Evaluator(model, val_loader, device=device, num_classes=num_classes)
+    start_time = time.time()
     for epoch in range(epochs):
         model.train()
         for _, batch in enumerate(train_loader):
@@ -336,7 +338,7 @@ def train_and_save_model(root: str, open_save: bool = False, save_path: str = ""
         if val_acc > best_acc_val:
             best_acc_val = val_acc
             best_state_dict = copy.deepcopy(model.state_dict())
-
+    print(f"Total training time: {time.time() - start_time:.2f}s")
     print(
         f"Best Validation Accuracy: {best_acc_val:.4f}, Total Parameters: {total_params}"
     )
@@ -345,7 +347,6 @@ def train_and_save_model(root: str, open_save: bool = False, save_path: str = ""
 
     # save model
     if open_save:
-        save_path = save_path
         torch.save(
             {
                 "model_state_dict": best_state_dict,
@@ -364,7 +365,7 @@ def train_and_save_model(root: str, open_save: bool = False, save_path: str = ""
 
 if __name__ == "__main__":
     root = "/home/tyf/Project/Tantic/raw_feature/stgc_sp_all_class_tls_3"
-    model_save_path = "./checkpoints/payload_gnn_model.pth"
+    model_save_path = "./checkpoints/mfts_payload_gnn_model.pth"
     best_acc_val = float(0.0)
     best_state_dict = None
     loader_builder = DataLoaderBuilder(root, num_classes=17, batch_size=512)

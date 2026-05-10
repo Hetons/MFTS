@@ -1,17 +1,21 @@
+from ast import Tuple
 import os, glob
+from tracemalloc import start
+from typing import Any, cast
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 import torch.nn.functional as F
+from torch_geometric.nn import GraphNorm
 from torch_geometric.nn import (
     GATv2Conv,
     SAGPooling,
     global_mean_pool,
-    global_add_pool,
-    global_max_pool,
 )
+import time
+from util import profile_model_inference
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -76,7 +80,72 @@ class ShardedGraphDataset(Dataset):
         )
 
 
-class GATGraphClassifier(torch.nn.Module):
+class DataLoaderBuilder:
+    def __init__(
+        self,
+        root: str,
+        num_classes: int,
+        batch_size: int = 512,
+        test_dataset_ratio: float = 0.2,
+    ):
+        self.num_classes = num_classes
+        dataset = ShardedGraphDataset(root, num_classes=num_classes)
+        # 切分训练集和验证集 8 : 2
+        from sklearn.model_selection import train_test_split
+
+        if os.path.exists(f"{root}/train_idx.npy") and os.path.exists(
+            f"{root}/val_idx.npy"
+        ):
+            train_idx = np.load(f"{root}/train_idx.npy")
+            val_idx = np.load(f"{root}/val_idx.npy")
+            print(f"split config load from disk, no re-generate")
+        else:
+            labels = np.array([data.y.item() for data in dataset])
+            idx = np.arange(len(dataset))
+            train_idx, val_idx = train_test_split(
+                idx, test_size=test_dataset_ratio, random_state=42, stratify=labels
+            )
+            # 保存
+            np.save(f"{root}/train_idx.npy", train_idx)
+            np.save(f"{root}/val_idx.npy", val_idx)
+
+        # 使用
+        train_dataset = torch.utils.data.Subset(dataset, train_idx)
+        val_dataset = torch.utils.data.Subset(dataset, val_idx)
+
+        self.train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True,
+            prefetch_factor=2,
+        )
+        self.val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+        # calc weighted class weights
+        label_counts = np.zeros(num_classes, dtype=np.int64)
+        for data in train_dataset:
+            label_counts[data.y.item()] += 1  # labels are 0..16
+        total_counts = label_counts.sum()
+        class_weights = total_counts / (num_classes * np.maximum(label_counts, 1))
+        class_weights = torch.from_numpy(class_weights).float().to(device)
+        self.class_weights = class_weights
+
+    def get_all_loader(self):
+        return self.train_loader, self.val_loader
+
+    def get_class_weights(self):
+        return self.class_weights
+
+    def get_feature_dim(self):
+        return self.train_loader.dataset[0].x.shape[1]
+
+    def get_num_classes(self):
+        return self.num_classes
+
+
+class StcWfModel(torch.nn.Module):
     def __init__(
         self,
         in_dim,
@@ -102,25 +171,31 @@ class GATGraphClassifier(torch.nn.Module):
             dropout=dropout_param,
             edge_dim=2,
         )
-        self.lin = torch.nn.Linear(hidden_dim, num_classes)
-        self.sagPool = SAGPooling(hidden_dim, ratio=sag_pool_ratio)
         self.dropout_param = dropout_param
-        self.norm1 = torch.nn.LayerNorm(hidden_dim * heads)
-        self.norm2 = torch.nn.LayerNorm(hidden_dim)
+        self.norm1 = GraphNorm(hidden_dim * heads)
+        self.norm2 = GraphNorm(hidden_dim)
+        self.mlp = torch.nn.Sequential(
+            torch.nn.Linear(hidden_dim, hidden_dim),
+            torch.nn.ELU(),
+            torch.nn.Dropout(p=dropout_param),
+            torch.nn.Linear(hidden_dim, num_classes),
+        )
+        self.sag_pool_ratio = sag_pool_ratio
+        self.sag_pooling = SAGPooling(hidden_dim, ratio=self.sag_pool_ratio)
 
     def forward(self, x, edge_index, edge_attr, batch):
-        # x : [1024, 310]. [batch_flow_num, feature_dim]
         x = self.conv1(x, edge_index, edge_attr)
         x = self.norm1(x)
         x = F.elu(x)
-        x = F.dropout(x, p=self.dropout_param, training=self.training)
+
         x = self.conv2(x, edge_index, edge_attr)
         x = self.norm2(x)
         x = F.elu(x)
-        x = F.dropout(x, p=self.dropout_param, training=self.training)
-        x, edge_index, _, batch, _, _ = self.sagPool(x, edge_index, edge_attr, batch)
-        x = global_max_pool(x, batch)
-        return self.lin(x)  # [num_graphs, num_classes] [batch_size, num_classes]
+
+        x, edge_index, _, batch, _, _ = self.sag_pooling(x, edge_index, None, batch)
+        x = global_mean_pool(x, batch)
+
+        return self.mlp(x)
 
 
 class Evaluator:
@@ -129,6 +204,22 @@ class Evaluator:
         self.loader = loader
         self.device = device
         self.num_classes = num_classes
+
+    def quick_evaluate(self) -> float:
+        correct = 0
+        total = 0
+        self.model.eval()
+        with torch.no_grad():
+            for batch in self.loader:
+                batch = batch.to(self.device)
+                logits = self.model(
+                    batch.x, batch.edge_index, batch.edge_attr, batch.batch
+                )
+                pred = logits.argmax(dim=-1)
+                correct += (pred == batch.y).sum().item()
+                total += batch.y.numel()
+        accuracy = correct / total
+        return accuracy
 
     def evaluate(self):
         from sklearn.metrics import classification_report
@@ -155,10 +246,11 @@ class Evaluator:
         )
 
         accuracy = (y_pred == y_true).mean()
-        return accuracy, report
+        cm = self._compute_confusion_matrix()
+        return accuracy, report, cm
 
     # 混淆矩阵
-    def compute_confusion_matrix(self):
+    def _compute_confusion_matrix(self):
         from sklearn.metrics import confusion_matrix
 
         self.model.eval()
@@ -179,48 +271,55 @@ class Evaluator:
         return cm
 
 
-def train_model(root: str):
-    is_save_model = False
+class ProfileLoaderView:
+    def __init__(self, base_loader):
+        self.base_loader = base_loader
+
+    def __iter__(self):
+        for batch in self.base_loader:
+            yield batch, batch.y
+
+    def __len__(self):
+        return len(self.base_loader)
+
+
+class ProfileForwardWrapper(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module):
+        super().__init__()
+        self.model = model
+
+    def forward(self, batch):
+        return self.model(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
+
+
+def print_profile_metrics(metrics: dict):
+    print("\n=== Inference Profile (utils.profile_model_inference) ===")
+    print(f"Device: {metrics['device']}")
+    print(f"Batch size: {metrics['batch_size']}")
+    print(f"Params: {metrics['params']:,}")
+    print(f"MACs/sample: {metrics['macs_per_sample']:.2f}")
+    print(f"FLOPs/sample: {metrics['flops_per_sample']:.2f}")
+    print(f"MACs/batch: {metrics['macs_per_batch']}")
+    print(f"FLOPs/batch: {metrics['flops_per_batch']}")
+    print(f"Avg batch latency: {metrics['avg_batch_latency_ms']:.4f} ms")
+    print(f"Avg sample latency: {metrics['avg_sample_latency_ms']:.6f} ms")
+    print(f"Throughput: {metrics['throughput_samples_per_s']:.2f} samples/s")
+
+
+def train_and_save_model(root: str, open_save: bool = False, save_path: str = ""):
+    global best_acc_val, best_state_dict
     num_classes = 17
-    test_dataset_ratio = 0.2
-    batch_size = 512
-    dataset = ShardedGraphDataset(root, num_classes=num_classes)
-    # 切分训练集和验证集 8 : 2
-    n = len(dataset)
-    n_val = int(test_dataset_ratio * n)
-    n_train = n - n_val
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [n_train, n_val], generator=torch.Generator().manual_seed(42)
-    )
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        prefetch_factor=2,
-    )
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-
-    # calc weighted class weights
-    label_counts = np.zeros(num_classes, dtype=np.int64)
-    for data in train_dataset:
-        label_counts[data.y.item()] += 1  # labels are 0..16
-    total_counts = label_counts.sum()
-    class_weights = total_counts / (num_classes * np.maximum(label_counts, 1))
-    class_weights = torch.from_numpy(class_weights).float().to(device)
-
-    loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights)
+    train_loader, val_loader = loader_builder.get_all_loader()
+    class_weights = loader_builder.get_class_weights()
 
     search_heads = 8
-    search_hidden_dim = 128
+    search_hidden_dim = 256
     search_lr = 5e-4
     search_dropout = 0.1
     epochs = 100
 
-    model = GATGraphClassifier(
-        in_dim=dataset[0].x.shape[1],
+    model = StcWfModel(
+        in_dim=loader_builder.get_feature_dim(),
         hidden_dim=search_hidden_dim,
         num_classes=num_classes,
         heads=search_heads,
@@ -229,11 +328,12 @@ def train_model(root: str):
 
     # 计算模型参数量
     total_params = sum(p.numel() for p in model.parameters())
+    import copy
 
     opt = torch.optim.Adam(model.parameters(), lr=search_lr)
     loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights)
     evaluator = Evaluator(model, val_loader, device=device, num_classes=num_classes)
-
+    start_time = time.time()
     for epoch in range(epochs):
         model.train()
         for _, batch in enumerate(train_loader):
@@ -243,19 +343,25 @@ def train_model(root: str):
             loss = loss_fn(logits, batch.y)
             loss.backward()
             opt.step()
-    val_acc, report = evaluator.evaluate()
-    print(f"Validation Accuracy: {val_acc:.4f}, Total Parameters: {total_params}")
+        val_acc = evaluator.quick_evaluate()
+        if val_acc > best_acc_val:
+            best_acc_val = val_acc
+            best_state_dict = copy.deepcopy(model.state_dict())
+    print(f"Total training time: {time.time() - start_time:.2f}s")
+    print(
+        f"Best Validation Accuracy: {best_acc_val:.4f}, Total Parameters: {total_params}"
+    )
     # print("\n=== Classification Report ===")
     # print(report)
 
     # save model
-    if is_save_model:
-        save_path = "./checkpoints/payload_gnn_model.pth"
+    if open_save:
+        save_path = save_path
         torch.save(
             {
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": best_state_dict,
                 "config": {
-                    "in_dim": dataset[0].x.shape[1],
+                    "in_dim": loader_builder.get_feature_dim(),
                     "hidden_dim": search_hidden_dim,
                     "num_classes": num_classes,
                     "heads": search_heads,
@@ -269,6 +375,50 @@ def train_model(root: str):
 
 if __name__ == "__main__":
     root = "/home/tyf/Project/Tantic/raw_feature/stgc_sp_all_class_tls_3"
+    model_save_path = "./checkpoints/stc_wf_payload_gnn_model.pth"
+    best_acc_val = float(0.0)
+    best_state_dict = None
+    loader_builder = DataLoaderBuilder(root, num_classes=17, batch_size=512)
     for i in range(5):
         print(f"--- Training Round {i+1} ---")
-        train_model(root)
+        train_and_save_model(root, save_path=model_save_path, open_save=True)
+
+    # output val_acc
+    print(
+        f"Best Validation Accuracy: {best_acc_val:.4f}, starting detailed evaluation..."
+    )
+
+    # load model and evaluate detailed
+    payload_model_check_point = torch.load(model_save_path)
+    payload_model = StcWfModel(
+        in_dim=payload_model_check_point["config"]["in_dim"],
+        hidden_dim=payload_model_check_point["config"]["hidden_dim"],
+        num_classes=payload_model_check_point["config"]["num_classes"],
+        heads=payload_model_check_point["config"]["heads"],
+        dropout_param=payload_model_check_point["config"]["dropout_param"],
+    ).to(device)
+    payload_model.load_state_dict(payload_model_check_point["model_state_dict"])
+
+    # 性能评估
+    profile_metrics = profile_model_inference(
+        model=ProfileForwardWrapper(payload_model),
+        data_loader=cast(Any, ProfileLoaderView(loader_builder.val_loader)),
+        device=str(device),
+        warmup_steps=20,
+        measure_steps=100,
+    )
+    print_profile_metrics(profile_metrics)
+
+    # 准确率评估
+    evaluator = Evaluator(
+        payload_model,
+        loader_builder.val_loader,
+        device=device,
+        num_classes=loader_builder.get_num_classes(),
+    )
+    acc, report, cm = evaluator.evaluate()
+    print(f"Final Evaluation Accuracy: {acc:.4f}")
+    print("\n=== Classification Report ===")
+    print(report)
+    print("\n=== Confusion Matrix ===")
+    print(cm)

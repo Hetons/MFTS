@@ -186,3 +186,4 @@ cython_debug/
 
 # Custom
 scapy-ssl_tls
+tb_logs

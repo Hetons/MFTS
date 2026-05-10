@@ -103,7 +103,8 @@ class TCN(nn.Module):
 
 
     def forward(self, inputs):
-        inputs= torch.transpose(inputs,2,1)
+        inputs = torch.transpose(inputs, 2, 1)
+        inputs = inputs.abs().long().clamp(min=0, max=self.vocab_text_size - 1)
         new_inputs = F.one_hot(inputs, num_classes=self.vocab_text_size).float()
         new_inputs = self.con_embed(new_inputs).squeeze()
         '''
