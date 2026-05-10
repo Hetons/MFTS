@@ -133,7 +133,7 @@ if __name__ == "__main__":
 
     model = FusionModel(
         quick_ratio=0.99,
-        tls_model_path="/home/tyf/Project/Tantic/checkpoints/mfts_fast_tls_cnn.pth",
+        tls_model_path="/home/tyf/Project/Tantic/checkpoints/fast_tls_cnn.pth",
         payload_model_path="/home/tyf/Project/Tantic/checkpoints/mfts_payload_gnn_model.pth",
     )
 
@@ -241,7 +241,7 @@ if __name__ == "__main__":
                 )
                 payload_probs = torch.softmax(payload_pred, dim=1)
                 fused_probs = (
-                    0.5 * payload_probs[~quick_mask] + 0.5 * tls_probs[~quick_mask]
+                    0.6 * payload_probs[~quick_mask] + 0.4 * tls_probs[~quick_mask]
                 )
                 final_pred[~quick_mask] = fused_probs.argmax(dim=1)
 
@@ -284,6 +284,6 @@ if __name__ == "__main__":
         )
 
     # save y_pred and y_true for further analysis
-    os.makedirs(f"{root_dir}/result", exist_ok=True)
-    np.save(f"{root_dir}/result/fusion_y_true.npy", fusion_trues)
-    np.save(f"{root_dir}/result/fusion_y_pred.npy", fusion_preds)
+    # os.makedirs(f"{root_dir}/result", exist_ok=True)
+    # np.save(f"{root_dir}/result/fusion_y_true.npy", fusion_trues)
+    # np.save(f"{root_dir}/result/fusion_y_pred.npy", fusion_preds)
