@@ -15,6 +15,7 @@ from torch_geometric.nn import (
     global_mean_pool,
 )
 import time
+import argparse
 from util import profile_model_inference
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -374,51 +375,72 @@ def train_and_save_model(root: str, open_save: bool = False, save_path: str = ""
 
 
 if __name__ == "__main__":
-    root = "/home/tyf/Project/Tantic/raw_feature/stgc_sp_all_class_tls_3"
-    model_save_path = "./checkpoints/stc_wf_payload_gnn_model.pth"
-    best_acc_val = float(0.0)
-    best_state_dict = None
+
+    # 获取命令行参数
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--model", type=str, default="train", help="Model to run: 'train' or 'eval'"
+    )
+    parser.add_argument(
+        "--model_save_path",
+        type=str,
+        default="./checkpoints/stc_wf_payload_gnn_model.pth",
+        help="Path to save the trained model",
+    )
+    parser.add_argument(
+        "--dataset_folder",
+        type=str,
+        default="/home/tyf/Project/Tantic/raw_feature/stgc_sp_all_class_tls_3",
+        help="Path to the dataset folder containing the .npy files",
+    )
+
+    args = parser.parse_args()
+    root = args.dataset_folder
     loader_builder = DataLoaderBuilder(root, num_classes=17, batch_size=512)
-    for i in range(5):
-        print(f"--- Training Round {i+1} ---")
-        train_and_save_model(root, save_path=model_save_path, open_save=True)
+    model_save_path = args.model_save_path
+    if args.model == "train":
+        best_acc_val = float(0.0)
+        best_state_dict = None
+        for i in range(5):
+            print(f"--- Training Round {i+1} ---")
+            train_and_save_model(root, save_path=model_save_path, open_save=True)
+        # output val_acc
+        print(
+            f"Best Validation Accuracy: {best_acc_val:.4f}, starting detailed evaluation..."
+        )
+    elif args.model == "eval":
+        # load model and evaluate detailed
+        payload_model_check_point = torch.load(model_save_path)
+        payload_model = StcWfModel(
+            in_dim=payload_model_check_point["config"]["in_dim"],
+            hidden_dim=payload_model_check_point["config"]["hidden_dim"],
+            num_classes=payload_model_check_point["config"]["num_classes"],
+            heads=payload_model_check_point["config"]["heads"],
+            dropout_param=payload_model_check_point["config"]["dropout_param"],
+        ).to(device)
+        payload_model.load_state_dict(payload_model_check_point["model_state_dict"])
 
-    # output val_acc
-    print(
-        f"Best Validation Accuracy: {best_acc_val:.4f}, starting detailed evaluation..."
-    )
+        # 性能评估
+        profile_metrics = profile_model_inference(
+            model=ProfileForwardWrapper(payload_model),
+            data_loader=cast(Any, ProfileLoaderView(loader_builder.val_loader)),
+            device=str(device),
+            warmup_steps=20,
+            measure_steps=100,
+        )
+        print_profile_metrics(profile_metrics)
 
-    # load model and evaluate detailed
-    payload_model_check_point = torch.load(model_save_path)
-    payload_model = StcWfModel(
-        in_dim=payload_model_check_point["config"]["in_dim"],
-        hidden_dim=payload_model_check_point["config"]["hidden_dim"],
-        num_classes=payload_model_check_point["config"]["num_classes"],
-        heads=payload_model_check_point["config"]["heads"],
-        dropout_param=payload_model_check_point["config"]["dropout_param"],
-    ).to(device)
-    payload_model.load_state_dict(payload_model_check_point["model_state_dict"])
-
-    # 性能评估
-    profile_metrics = profile_model_inference(
-        model=ProfileForwardWrapper(payload_model),
-        data_loader=cast(Any, ProfileLoaderView(loader_builder.val_loader)),
-        device=str(device),
-        warmup_steps=20,
-        measure_steps=100,
-    )
-    print_profile_metrics(profile_metrics)
-
-    # 准确率评估
-    evaluator = Evaluator(
-        payload_model,
-        loader_builder.val_loader,
-        device=device,
-        num_classes=loader_builder.get_num_classes(),
-    )
-    acc, report, cm = evaluator.evaluate()
-    print(f"Final Evaluation Accuracy: {acc:.4f}")
-    print("\n=== Classification Report ===")
-    print(report)
-    print("\n=== Confusion Matrix ===")
-    print(cm)
+        # 准确率评估
+        evaluator = Evaluator(
+            payload_model,
+            loader_builder.val_loader,
+            device=device,
+            num_classes=loader_builder.get_num_classes(),
+        )
+        acc, report, cm = evaluator.evaluate()
+        print(f"Final Evaluation Accuracy: {acc:.4f}")
+        print("\n=== Classification Report ===")
+        print(report)
+        print("\n=== Confusion Matrix ===")
+        print(cm)

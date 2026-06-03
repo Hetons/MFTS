@@ -5,6 +5,8 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 import time
 from util import profile_model_inference
+import argparse
+
 
 def cumulate_features(p_seq, n=100):
     """
@@ -242,6 +244,8 @@ def train_cumul_torch_with_loader(
 
 if __name__ == "__main__":
     # 简单测试
+
+    args = argparse.ArgumentParser()
 
     root_dir = "/home/tyf/Project/Tantic/raw_feature/cumul_all_class"
     device = "cuda" if torch.cuda.is_available() else "cpu"

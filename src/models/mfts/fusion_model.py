@@ -133,7 +133,7 @@ if __name__ == "__main__":
 
     model = FusionModel(
         quick_ratio=0.99,
-        tls_model_path="/home/tyf/Project/Tantic/checkpoints/fast_tls_cnn.pth",
+        tls_model_path="/home/tyf/Project/Tantic/checkpoints/mfts_fast_tls_cnn.pth",
         payload_model_path="/home/tyf/Project/Tantic/checkpoints/mfts_payload_gnn_model.pth",
     )
 
