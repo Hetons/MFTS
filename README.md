@@ -10,7 +10,7 @@
 
 项目背景：https://larkcommunity.feishu.cn/wiki/P2Tnwd1X6iPkmQk8kr1cklymngk
 
-![image-1743238512369](https://kauizhaotan.oss-accelerate.aliyuncs.com/blog/image-1743238512369.png?x-oss-process=style/water)
+![image-1743238512369](https://kauizhaotan.oss-cn-shanghai.aliyuncs.com/PhotoOmmit/1780624425434-cywofc.png)
 
 
 ## 目录结构
@@ -56,10 +56,13 @@ Tantic/
 
 ## 环境依赖
 
-### Python 版本
-- Python 3.8+
+###  实验环境
+![实验环境](https://kauizhaotan.oss-cn-shanghai.aliyuncs.com/PhotoOmmit/1780623991426-3wyx03.png)
+
 
 ### 依赖包安装
+
+  项目采用 Python 3.8+
 
 ```bash
 pip install -r requirements.txt
@@ -78,7 +81,7 @@ pip install -r requirements.txt
 - `optuna==4.6.0`：超参数优化
 
 
-### 2.1 TLS 插件安装
+### TLS 插件安装
 
 由于 scapy 官方库暂时不支持 tls 解析，因此需要安装插件，可以通过如下命令下载源库：
 
@@ -112,5 +115,3 @@ ln -s -f libc.a liblibc.a
 ```
 
 
-## 实验环境
-![实验环境](https://kauizhaotan.oss-cn-shanghai.aliyuncs.com/PhotoOmmit/1780623991426-3wyx03.png)
