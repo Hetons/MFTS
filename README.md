@@ -81,6 +81,22 @@ pip install -r requirements.txt
 - `optuna==4.6.0`：超参数优化
 
 
+
+### 整体测试
+
+```shell
+# 运行脚本用法：参数说明
+#   mfts   - 运行 MFTS 方法（本文方法）
+#   stc-wf - 运行 STC-WF 基线方法
+#   cumul  - 运行 CUMUL 基线方法
+#   tatic  - 运行 TaTic 基线方法
+#   all    - 运行全部方法
+bash run.sh <mfts|stc-wf|cumul|tatic|all>
+
+# 示例：运行 MFTS 方法
+# bash run.sh mfts
+```
+
 ### TLS 插件安装
 
 由于 scapy 官方库暂时不支持 tls 解析，因此需要安装插件，可以通过如下命令下载源库：
