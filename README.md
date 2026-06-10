@@ -16,42 +16,47 @@
 ## 目录结构
 
 ```
-Tantic/
+MFTS/
 ├── README.md                    # 项目说明文档
-├── requirements.txt             # Python依赖包列表
-├── configs/                     # 配置文件
-│   └── default_config.yaml      # 默认配置
-├── notebooks/                   # Jupyter notebooks
+├── requirements.txt             # Python 依赖包列表
+├── run.sh                       # 模型测试/评估入口脚本
+├── raw_data_demo.json           # 原始流量样本结构示例
+├── notebooks/                   # Jupyter notebooks 与调试脚本
 │   ├── data_preprocess.ipynb    # 数据预处理
 │   ├── data_research.ipynb      # 数据探索分析
 │   ├── data_visualization.ipynb # 数据可视化
+│   ├── debug_tls_data.py        # TLS 数据调试脚本
 │   └── train.ipynb              # 模型训练
-├── src/                         # 源代码
-│   ├── preprocessing/           # 数据预处理模块
-│   │   ├── flow_extract.py      # 流量提取
-│   │   ├── tls_exact.py         # TLS特征提取
-│   │   ├── feature_collect.py   # 特征收集
-│   │   ├── util.py              # 工具函数
-│   │   └── ...
-│   └── models/                  # 模型实现
-│       ├── mfts/                # MFTS方法（本文方法）
-│       │   ├── mfts_early_model.py   # TLS特征快速分类
-│       │   ├── mfts_refine_model.py  # Payload图特征精化分类
-│       │   └── fusion_model.py       # 两阶段融合模型
-│       ├── cumul/               # CUMUL方法（对比基线）
-│       │   └── cumul.py
-│       ├── tatic/               # TaTic方法（对比基线）
-│       │   ├── README.md
-│       │   ├── 01_easy_flow_modeling/    # 简单流建模
-│       │   ├── 02_hard_flow_modeling/    # 困难流建模
-│       │   ├── 03_easy-hard_classification/  # 分类器
-│       │   ├── needdata/        # 训练所需数据
-│       │   └── save_models/     # 保存的模型
-│       └── stc-wf/              # STC-WF方法（对比基线）
-│           └── model.py
-├── raw_data_demo.json           # 原始数据示例
-├── training_results.db          # 训练结果数据库
-└── debug_tls_data.py            # TLS数据调试脚本
+└── src/                         # 源代码
+    ├── preprocessing/           # 数据预处理模块
+    │   ├── __main__.py          # 预处理入口
+    │   ├── flow_extract.py      # 流量提取
+    │   ├── tls_exact.py         # TLS 特征提取
+    │   ├── feature_collect.py   # 特征收集与图构建
+    │   ├── sinker.py            # 特征落盘
+    │   ├── util.py              # 工具函数
+    │   └── analyais.py          # 数据分析脚本
+    └── models/                  # 模型实现
+        ├── mfts/                # MFTS 方法（本文方法）
+        │   ├── mfts_early_model.py       # TLS 特征快速分类
+        │   ├── mfts_refine_model.py      # Payload 图特征精细分类
+        │   ├── fusion_model.py           # 两阶段融合模型
+        │   ├── analyze_tls_confidence.py # TLS 置信度分析
+        │   ├── search_fusion_params.py   # 融合参数搜索
+        │   └── util.py
+        ├── cumul/               # CUMUL 方法（对比基线）
+        │   ├── cumul.py
+        │   └── util.py
+        ├── stc-wf/              # STC-WF 方法（对比基线）
+        │   ├── model.py
+        │   └── util.py
+        └── tatic/               # TaTic 方法（对比基线）
+            ├── README.md
+            ├── 01_easy_flow_modeling/          # 简单流建模
+            ├── 02_hard_flow_modeling/          # 困难流建模
+            ├── 03_easy-hard_classification/    # 简单/困难流分类器
+            ├── needdata/                       # 训练所需数据
+            └── save_models/                    # 保存的模型
 ```
 
 ## 环境依赖
@@ -80,7 +85,99 @@ pip install -r requirements.txt
 - `tensorboard==2.20.0`：训练可视化
 - `optuna==4.6.0`：超参数优化
 
+### 路径配置说明
 
+当前仓库中的部分脚本仍保留作者实验环境下的绝对路径，直接在新机器上运行前需要先修改为本地路径。
+
+主要涉及位置如下：
+
+| 文件 | 需要关注的配置 | 说明 |
+| --- | --- | --- |
+| `run.sh` | `/home/tyf/Project/Tantic/...` | 模型测试/评估脚本路径，需要改为当前项目根目录或相对路径。 |
+| `src/preprocessing/__main__.py` | `REMOTE_RAW_DATA_DIR` | 原始 pcap 数据目录。 |
+| `src/preprocessing/__main__.py` | `PRODUCT_OUTPUT_DIR` | 预处理后特征输出目录。 |
+| `src/models/mfts/*.py`、`src/models/cumul/cumul.py` 等 | 数据集路径、checkpoint 路径 | 训练或评估前需要确认特征目录和模型权重路径存在。 |
+
+建议在本地统一整理为如下目录结构，再将脚本中的路径替换为对应位置：
+
+```text
+MFTS/
+├── data/
+│   ├── raw/          # 原始 pcap 或原始样本数据
+│   └── processed/    # 预处理后的特征数据
+├── checkpoints/      # 训练得到的模型权重
+└── src/
+```
+
+例如，可以将：
+
+```python
+REMOTE_RAW_DATA_DIR = "/home/tyf/fnnas/Study/Traffic-data/train_raw_data"
+PRODUCT_OUTPUT_DIR = "/home/tyf/Project/Tantic/raw_feature/stgc_sp_all_class_tls_5"
+```
+
+改为本机可访问的路径：
+
+```python
+REMOTE_RAW_DATA_DIR = "./data/raw"
+PRODUCT_OUTPUT_DIR = "./data/processed/stgc_sp_all_class_tls_5"
+```
+
+> 注意：若仅运行已经生成好的特征或 checkpoint，也需要保证对应脚本中的数据目录、模型权重路径与本机实际位置一致。
+
+### 数据格式说明
+
+#### 原始数据
+
+项目预处理入口为 `src/preprocessing/__main__.py`，默认从 `REMOTE_RAW_DATA_DIR` 指定的目录读取原始流量样本。原始样本通常来自 pcap 流量文件及其类别标签，`raw_data_demo.json` 给出了单个样本被解析后的结构示例。
+
+解析后的一个访问样本包含多条 TCP flow，每条 flow 中包含如下信息：
+
+- `packet_length`：包长序列
+- `timestamp`：时间戳序列
+- `flags`：TCP flags
+- `payload_length`：payload 长度序列
+- `window_size`：TCP 窗口大小序列
+- `direction`：上下行方向
+- `dst_ip`：目的 IP
+- `handshake`：TLS 握手相关字段
+
+#### 预处理输出
+
+预处理模块支持生成 MFTS、CUMUL 和 TaTic 三类数据格式。
+
+**MFTS 图数据**
+
+由 `collect_mfts()` 生成，输出为分片 `.npy` 文件组和 `meta.json`：
+
+| 文件 | 含义 |
+| --- | --- |
+| `X_000.npy`、`X_001.npy` ... | 图节点特征，包含每条流的包序列特征与统计特征。 |
+| `y_000.npy`、`y_001.npy` ... | 样本类别标签。 |
+| `edges_000.npy`、`edges_001.npy` ... | 图边索引，表示 flow 之间的连接关系。 |
+| `edge_ptr_000.npy`、`edge_ptr_001.npy` ... | 每个样本在边数组中的起止位置指针。 |
+| `edge_attr_000.npy`、`edge_attr_001.npy` ... | 边属性，例如目的 IP 相似度、时间衰减等。 |
+| `T_000.npy`、`T_001.npy` ... | TLS 早期特征序列，用于 MFTS-early。 |
+| `meta.json` | 数据集元信息，例如样本数、分片数、特征配置等。 |
+
+**CUMUL 数据**
+
+由 `collect_cumul()` 生成：
+
+| 文件 | 含义 |
+| --- | --- |
+| `X.npy` | CUMUL 特征矩阵。 |
+| `y.npy` | 样本类别标签。 |
+| `meta.json` | 数据集元信息。 |
+
+**TaTic 数据**
+
+由 `collect_tatic()` 生成：
+
+| 文件 | 含义 |
+| --- | --- |
+| `tatic_features.csv` | TaTic 所需的流级 CSV 特征。 |
+| `meta.json` | 数据集元信息。 |
 
 ### 整体测试
 
