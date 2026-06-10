@@ -1,3 +1,16 @@
+"""
+TATIC easy-hard 联合分类推理性能评估工具
+
+与 stc-wf/util.py 接口相同，但额外返回 model_param_device 和 input_device，
+便于验证多 GPU / CPU 场景下的设备一致性。
+
+额外返回字段（相比 cumul/util.py）：
+    model_param_device: 模型参数所在设备（str）
+    input_device:       输入张量所在设备（str）
+
+MACs 统计范围：Linear 和 Conv1d/2d/3d 层（不含激活函数）。
+"""
+
 import time
 from typing import Any, Dict, Optional
 import numpy as np
@@ -13,16 +26,25 @@ def profile_model_inference(
     warmup_steps: int = 20,
     measure_steps: int = 100,
 ) -> Dict[str, Any]:
-    """
-    统一口径的推理性能评估。
+    """统一口径的推理性能评估（TATIC 版，含设备诊断字段）。
 
-    口径定义：
-    1) 参数量: 所有可训练/不可训练参数总数
-    2) MACs: 仅统计主算子(Linear/Conv)的 multiply-accumulate 次数
-    3) FLOPs: 按 FLOPs = 2 * MACs 计算
-    4) 推理延迟: 当前 batch 的平均前向耗时(ms)
-    5) 单样本延迟: batch 延迟 / batch_size
-    6) 吞吐: batch_size / batch 延迟(s)
+    流程：
+        1. 将模型和输入 batch 移到目标设备
+        2. 注册 Linear/Conv forward hook 统计 MACs
+        3. warmup_steps 次预热
+        4. measure_steps 次计时，取均值
+
+    Args:
+        model: 待评估模型
+        data_loader: 数据加载器，只取第一个 batch
+        device: 目标设备（None 时自动选 cuda/cpu）
+        warmup_steps: 预热轮次
+        measure_steps: 计时轮次
+
+    Returns:
+        dict 包含：device, model_param_device, input_device, batch_size, params,
+        macs_per_batch, flops_per_batch, macs_per_sample, flops_per_sample,
+        avg_batch_latency_ms, avg_sample_latency_ms, throughput_samples_per_s
     """
     run_device = (
         torch.device(device)
@@ -50,7 +72,6 @@ def profile_model_inference(
 
     def _linear_hook(module, inputs, output):
         in_tensor = inputs[0]
-        # [B, in_features] -> [B, out_features]
         cur_batch = int(in_tensor.shape[0])
         macs = cur_batch * int(module.in_features) * int(module.out_features)
         macs_counter["macs"] += macs
@@ -59,7 +80,7 @@ def profile_model_inference(
         in_tensor = inputs[0]
         cur_batch = int(in_tensor.shape[0])
 
-        out_shape = output.shape  # [B, C_out, ...]
+        out_shape = output.shape
         out_elems_per_sample = int(np.prod(out_shape[1:]))
 
         kernel_elems = int(np.prod(module.kernel_size))

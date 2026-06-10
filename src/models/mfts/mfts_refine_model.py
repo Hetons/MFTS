@@ -1,3 +1,28 @@
+"""
+MFTS-refine: 基于图注意力网络的载荷精细分类模型
+
+设计动机：
+    当 MFTS-early（TLS 早期模型）的预测置信度不足时，启用本模型对
+    加密载荷的包级图结构进行精细分析。相比 early 模型，refine 模型
+    等待更多数据包到达，利用图结构捕捉流间时空依赖，提升分类准确率。
+
+模型结构（MtfsRefineModel）：
+    GATv2Conv (残差连接, 多头注意力 + 边特征)
+    → GraphNorm + ELU
+    → GATv2Conv (残差连接, 单头)
+    → GraphNorm + ELU
+    → global_max_pool + global_mean_pool → cat [max, mean]   # 双路读出
+    → MLP 分类头 (2*hidden_dim → hidden_dim → num_classes)
+
+与 StcWfModel 的关键差异：
+    1. 两层 GATv2 均启用 residual=True，缓解深层图网络的过平滑问题
+    2. 读出层使用 max+mean 拼接而非 SAGPooling+mean，
+       同时捕捉最显著节点（max）和全局分布（mean）的信息
+    3. MLP 输入维度为 2*hidden_dim（因 cat）
+
+输入格式：与 ShardedGraphDataset 返回的 PyG Data 对象一致
+"""
+
 from ast import Tuple
 import os, glob
 import numpy as np
@@ -16,13 +41,19 @@ from torch_geometric.nn import (
 )
 import time
 from torch_geometric.nn import AttentionalAggregation
-
 from torch_geometric.nn import Set2Set
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class ShardedGraphDataset(Dataset):
+    """载荷图数据集，与 stc-wf 的同名类共享接口，从 X_*.npy 分片加载。
+
+    注意：本类与 stc-wf/model.py 中的 ShardedGraphDataset 几乎相同，
+    两者均面向同一份分片数据（X/y/edges/edge_ptr/edge_attr），
+    区别在于所属模型不同（refine vs stc-wf 为对比实验设计）。
+    """
+
     def __init__(self, root, num_classes: int = 17):
         self.root = root
         self.shard_ids = sorted(
@@ -43,6 +74,7 @@ class ShardedGraphDataset(Dataset):
         return len(self.index)
 
     def _load_shard(self, sid):
+        """单 shard LRU 缓存，避免频繁磁盘 IO。"""
         if self._cache.get("sid") != sid:
             self._cache = {
                 "sid": sid,
@@ -61,20 +93,17 @@ class ShardedGraphDataset(Dataset):
         shard = self._load_shard(sid)
         x = torch.from_numpy(shard["X"][i]).float()
         ptr = shard["ptr"]
+        # 按累积指针切出第 i 个图的边
         e = shard["edges"][:, ptr[i] : ptr[i + 1]]
         edge_index = torch.from_numpy(e).long()
         edge_attr = torch.from_numpy(shard["edge_attr"][ptr[i] : ptr[i + 1]]).float()
-        # edge_attr = torch.zeros(
-        #     (edge_index.size(1), 2), dtype=torch.float, device=edge_index.device
-        # )
         y = shard["y"][i]
-        y = int(np.asarray(y).squeeze())  # 兼容 y 形状为 (1,)
+        y = int(np.asarray(y).squeeze())
 
-        # 清理 x 全为 0 的行 todo(tyf)
+        # 移除全零哑节点（padding 填充行）
         non_zero_mask = x.abs().sum(dim=1) != 0
         x = x[non_zero_mask]
 
-        # ✅ 添加断言检查标签范围
         assert 0 <= y <= self.num_classes, f"Label {y} out of range [0,13] at idx {idx}"
 
         return Data(
@@ -86,6 +115,8 @@ class ShardedGraphDataset(Dataset):
 
 
 class DataLoaderBuilder:
+    """构建训练/验证 DataLoader 及类别权重，与 stc-wf 版本接口相同。"""
+
     def __init__(
         self,
         root: str,
@@ -95,7 +126,6 @@ class DataLoaderBuilder:
     ):
         self.num_classes = num_classes
         dataset = ShardedGraphDataset(root, num_classes=num_classes)
-        # 切分训练集和验证集 8 : 2
         from sklearn.model_selection import train_test_split
 
         if os.path.exists(f"{root}/train_idx.npy") and os.path.exists(
@@ -110,11 +140,9 @@ class DataLoaderBuilder:
             train_idx, val_idx = train_test_split(
                 idx, test_size=test_dataset_ratio, random_state=42, stratify=labels
             )
-            # 保存
             np.save(f"{root}/train_idx.npy", train_idx)
             np.save(f"{root}/val_idx.npy", val_idx)
 
-        # 使用
         train_dataset = torch.utils.data.Subset(dataset, train_idx)
         val_dataset = torch.utils.data.Subset(dataset, val_idx)
 
@@ -128,10 +156,9 @@ class DataLoaderBuilder:
         )
         self.val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-        # calc weighted class weights
         label_counts = np.zeros(num_classes, dtype=np.int64)
         for data in train_dataset:
-            label_counts[data.y.item()] += 1  # labels are 0..16
+            label_counts[data.y.item()] += 1
         total_counts = label_counts.sum()
         class_weights = total_counts / (num_classes * np.maximum(label_counts, 1))
         class_weights = torch.from_numpy(class_weights).float().to(device)
@@ -151,6 +178,23 @@ class DataLoaderBuilder:
 
 
 class MtfsRefineModel(torch.nn.Module):
+    """MFTS 精细分类模型：双层残差 GATv2 + max/mean 双路读出。
+
+    核心设计：
+        1. 残差连接（residual=True）：防止图卷积层数增加时特征坍缩（过平滑）
+        2. 双路读出 max+mean：max 捕捉最典型的流特征，mean 表达全局分布，
+           两者拼接传入 MLP，信息更完整
+        3. MLP 输入 2*hidden_dim，因此第一层 Linear 为 2*hidden_dim → hidden_dim
+
+    Args:
+        in_dim: 节点输入特征维度
+        hidden_dim: GATv2 每头隐藏维度
+        num_classes: 分类类别数
+        heads: 第一层 GATv2 的注意力头数
+        dropout_param: Dropout 概率
+        sag_pool_ratio: 保留（当前未启用，可通过取消注释切换为 SAGPooling 版本）
+    """
+
     def __init__(
         self,
         in_dim,
@@ -161,14 +205,16 @@ class MtfsRefineModel(torch.nn.Module):
         sag_pool_ratio=0.5,
     ):
         super().__init__()
+        # 第一层：残差 GATv2，多头注意力 + 边特征融合
         self.conv1 = GATv2Conv(
             in_dim,
             hidden_dim,
             heads=heads,
             dropout=dropout_param,
             edge_dim=2,
-            residual=True,
+            residual=True,  # 残差：输入直接加到输出，缓解过平滑
         )
+        # 第二层：单头 GATv2，输出 hidden_dim
         self.conv2 = GATv2Conv(
             hidden_dim * heads,
             hidden_dim,
@@ -178,53 +224,48 @@ class MtfsRefineModel(torch.nn.Module):
             edge_dim=2,
             residual=True,
         )
-        # self.lin = torch.nn.Linear(hidden_dim, num_classes)
-        # self.sagPool = SAGPooling(hidden_dim, ratio=sag_pool_ratio)
         self.dropout_param = dropout_param
         self.norm1 = GraphNorm(hidden_dim * heads)
         self.norm2 = GraphNorm(hidden_dim)
-        # self.attention_lin = torch.nn.Linear(hidden_dim, 1)
+        # MLP：输入 2*hidden_dim（max+mean 拼接），输出 num_classes
         self.mlp = torch.nn.Sequential(
             torch.nn.Linear(2 * hidden_dim, hidden_dim),
             torch.nn.ELU(),
             torch.nn.Dropout(p=dropout_param),
             torch.nn.Linear(hidden_dim, num_classes),
         )
-        # self.set2set_readout = Set2Set(hidden_dim, processing_steps=3)
-        # self.attention_readout = AttentionalAggregation(gate_nn=self.attention_lin)
 
     def forward(self, x, edge_index, edge_attr, batch):
-        # x : [1024, 310]. [batch_flow_num, feature_dim]
+        """
+        Args:
+            x: 节点特征 [num_nodes, in_dim]
+            edge_index: 边索引 [2, num_edges]
+            edge_attr: 边属性 [num_edges, 2]
+            batch: 批次索引 [num_nodes]
+        Returns:
+            logits: [batch_size, num_classes]
+        """
+        # 第 1 层：多头注意力聚合
         x = self.conv1(x, edge_index, edge_attr)
         x = self.norm1(x)
         x = F.elu(x)
-        # x = F.dropout(x, p=self.dropout_param, training=self.training)
-        # [num_grphas, M, hidden_dim * heads]
 
-        # x: [1024, 64]  [batch_size, hidden_dim * heads]
+        # 第 2 层：进一步聚合
         x = self.conv2(x, edge_index, edge_attr)
         x = self.norm2(x)
         x = F.elu(x)
-        # x = F.dropout(x, p=self.dropout_param, training=self.training)
-        # x: [1024, 32]  [batch_size, hidden_dim] [1024, 32]
-        # x, edge_index, _, batch, _, _ = self.sagPool(x, edge_index, None, batch)
-        # x: [batch_size', hidden_dim] (batch_size' <= batch_size)
-        # x = global_mean_pool(x, batch)
-        # x = global_add_pool(x, batch)
 
-        # x = self.set2set_readout(x, batch)
+        # 双路读出：max 提取最强激活，mean 表达全局信息
+        max_x = global_max_pool(x, batch)             # [batch_size, hidden_dim]
+        mean_x = global_mean_pool(x, batch)           # [batch_size, hidden_dim]
+        x = torch.cat([max_x, mean_x], dim=-1)        # [batch_size, 2*hidden_dim]
 
-        # mean pool + max pool
-        max_x = global_max_pool(x, batch)
-        mean_x = global_mean_pool(x, batch)
-        x = torch.cat([max_x, mean_x], dim=-1)  # [batch_size, 2*hidden_dim]
-
-        # 图级别池化 [32, 32] -> [batch_size, hidden_dim]
-        return self.mlp(x)  # [num_graphs, num_classes] [batch_size, num_classes]
-        # return self.lin(x)
+        return self.mlp(x)
 
 
 class Evaluator:
+    """模型评估器（与 stc-wf 版本接口相同）。"""
+
     def __init__(self, model, loader, device, num_classes):
         self.model = model
         self.loader = loader
@@ -232,6 +273,7 @@ class Evaluator:
         self.num_classes = num_classes
 
     def quick_evaluate(self) -> float:
+        """快速计算整体准确率，适合训练中监控。"""
         correct = 0
         total = 0
         self.model.eval()
@@ -248,6 +290,7 @@ class Evaluator:
         return accuracy
 
     def evaluate(self):
+        """返回准确率、per-class 报告和混淆矩阵。"""
         from sklearn.metrics import classification_report
 
         self.model.eval()
@@ -265,7 +308,6 @@ class Evaluator:
         y_pred = np.concatenate(preds)
         y_true = np.concatenate(trues)
 
-        # 生成分类报告
         target_names = [f"Class_{i}" for i in range(self.num_classes)]
         report = classification_report(
             y_true, y_pred, target_names=target_names, digits=4, zero_division=0
@@ -275,8 +317,8 @@ class Evaluator:
         cm = self._compute_confusion_matrix()
         return accuracy, report, cm
 
-    # 混淆矩阵
     def _compute_confusion_matrix(self):
+        """计算混淆矩阵。"""
         from sklearn.metrics import confusion_matrix
 
         self.model.eval()
@@ -298,6 +340,10 @@ class Evaluator:
 
 
 def train_and_save_model(root: str, open_save: bool = False, save_path: str = ""):
+    """训练 MtfsRefineModel，多轮保留最优验证准确率权重。
+
+    与 stc-wf 训练流程相同：Adam + 加权 CrossEntropy + 每 epoch 验证。
+    """
     global best_acc_val, best_state_dict
     num_classes = 17
     train_loader, val_loader = loader_builder.get_all_loader()
@@ -317,7 +363,6 @@ def train_and_save_model(root: str, open_save: bool = False, save_path: str = ""
         dropout_param=search_dropout,
     ).to(device)
 
-    # 计算模型参数量
     total_params = sum(p.numel() for p in model.parameters())
     import copy
 
@@ -342,10 +387,7 @@ def train_and_save_model(root: str, open_save: bool = False, save_path: str = ""
     print(
         f"Best Validation Accuracy: {best_acc_val:.4f}, Total Parameters: {total_params}"
     )
-    # print("\n=== Classification Report ===")
-    # print(report)
 
-    # save model
     if open_save:
         torch.save(
             {
@@ -369,16 +411,17 @@ if __name__ == "__main__":
     best_acc_val = float(0.0)
     best_state_dict = None
     loader_builder = DataLoaderBuilder(root, num_classes=17, batch_size=512)
+
+    # 多轮训练（不同随机初始化），全局保留最优模型
     for i in range(5):
         print(f"--- Training Round {i+1} ---")
         train_and_save_model(root, save_path=model_save_path, open_save=True)
 
-    # output val_acc
     print(
         f"Best Validation Accuracy: {best_acc_val:.4f}, starting detailed evaluation..."
     )
 
-    # load model and evaluate detailed
+    # 加载最优 checkpoint 进行详细评估
     payload_model_check_point = torch.load(model_save_path)
     payload_model = MtfsRefineModel(
         in_dim=payload_model_check_point["config"]["in_dim"],

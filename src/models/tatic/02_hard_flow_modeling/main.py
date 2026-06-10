@@ -1,3 +1,26 @@
+"""
+TATIC hard-flow TCN 训练脚本
+
+TATIC 两阶段分类的第二阶段：对随机森林无法置信分类的"难"流使用 TCN 精细识别。
+
+数据来源：Data_Split.main() 加载 tatic_features.csv，提取绝对包长序列。
+模型：TCN（膨胀因果卷积 + 残差 + One-Hot 嵌入），见 model1.py。
+训练策略：
+    - Adam 优化器（lr=5e-3，betas=(0.9,0.999)）
+    - ReduceLROnPlateau 学习率调度（patience=20，factor=0.1）
+    - 5-fold 交叉验证，以 balanced_accuracy 选最优模型
+
+关键超参数（命令行参数）：
+    -input_channel: Conv2d 嵌入通道数（默认 64）
+    -in_ker_num:    TCN 每层通道数（默认 64）
+    -layers:        TCN 层数（默认 4，感受野 = 2*(2^4-1)*(ker-1)×2）
+    -seq_len:       输入序列长度，即使用前 N 个包（默认 16）
+    -ker_size:      TCN 卷积核大小（默认 13）
+    -fold:          K-fold 折数索引
+    -epochs:        训练轮数（默认 100）
+    -batch_size:    batch 大小（默认 256）
+"""
+
 import os
 import random
 import argparse
@@ -40,14 +63,12 @@ def get_args():
 
 args = get_args()
 max_acc = 0
-output_size = 17
-
+output_size = 17        # 17 类网站指纹
 dropout = 0.35
 save_dir = "./save_models/"
 if not os.path.exists(save_dir):
     os.mkdir(save_dir)
-vocab_text_size = 1500
-
+vocab_text_size = 1500  # 包长词表 = MTU，包长离散化到 [0, 1499]
 
 input_channel = args.input_channel
 num_channels = [args.in_ker_num] * args.layers
@@ -67,6 +88,7 @@ data = DS.main(file_dir, num_packs)
 
 
 def scramble_data(text):
+    """随机打乱数据列表，固定种子保证可复现。"""
     cc = list(zip(text))
     random.seed(100)
     random.shuffle(cc)
@@ -74,6 +96,7 @@ def scramble_data(text):
     return text[0]
 
 
+# 5-fold 划分：fold i 为 valid，(i+1)%5 为 test，其余 3 折为 train
 da = scramble_data(data)
 x = []
 for j in range(5):
@@ -84,6 +107,7 @@ test = x[(fold + 1) % 5]
 for i in range(2, 5):
     train += x[(i + fold) % 5]
 
+# 分离特征和标签（数据格式：[label, pkt_1, ..., pkt_N]，label 在首位）
 train_x = np.array(train, "int32")[:, 1:]
 train_y = np.array(train, "int32")[:, 0]
 valid_x = np.array(valid, "int32")[:, 1:]
@@ -100,6 +124,7 @@ new_text.append(list(test_y))
 
 
 def data_load(new_data, seq_leng):
+    """构建 train/valid/test DataLoader。"""
     train_dataloader = []
     valid_dataloader = []
     test_dataloader = []
@@ -143,6 +168,7 @@ def data_load(new_data, seq_leng):
 
 
 def train(model, device, train_loader, optimizer, epochs, i, loss_fn):
+    """执行一个 epoch 的训练，每 100 个 batch 打印一次 loss。"""
     model.train()
     total_loss = 0
     y_true = torch.LongTensor(0).to(device)
@@ -189,6 +215,7 @@ def train(model, device, train_loader, optimizer, epochs, i, loss_fn):
 
 
 def valid(model, device, dev_loader, epoch, i, loss_fn, num_epochs, scheduler):
+    """验证集评估，触发学习率调度器。"""
     model.eval()
     y_true = torch.LongTensor(0).to(device)
     y_predict = torch.LongTensor(0).to(device)
@@ -215,6 +242,7 @@ def valid(model, device, dev_loader, epoch, i, loss_fn, num_epochs, scheduler):
 
         acc = balanced_accuracy_score(y_true_trans, y_predict_trans)
         valid_acc = 100.0 * acc
+    # 基于验证 loss 动态降低学习率
     scheduler.step(avg_loss)
     print(
         "Fold {} epoch:{} valid Loss:{:.4f} valid acc:{:.4f}".format(
@@ -226,7 +254,7 @@ def valid(model, device, dev_loader, epoch, i, loss_fn, num_epochs, scheduler):
 
 
 def test(device, test_loader, i, loss_fn, save_dir, outname):
-
+    """加载最优模型权重进行测试集评估。"""
     model = TCN(
         input_channel=input_channel,
         output_size=output_size,
@@ -290,6 +318,7 @@ if __name__ == "__main__":
         model.parameters(), betas=(0.9, 0.999), lr=5e-3, weight_decay=0
     )
 
+    # 验证 loss 连续 20 epoch 无改善时，lr × 0.1（最小 1e-5）
     scheduler = lr_scheduler.ReduceLROnPlateau(
         optimizer, "min", factor=0.1, patience=20, verbose=True, min_lr=1e-5
     )

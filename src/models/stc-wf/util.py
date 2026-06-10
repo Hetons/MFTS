@@ -1,3 +1,20 @@
+"""
+推理性能评估工具（stc-wf 版本）
+
+提供统一口径的模型推理性能测量：
+  - 参数量（总参数数）
+  - MACs（仅统计 Linear/Conv 算子的乘加次数）
+  - FLOPs = 2 * MACs
+  - 推理延迟（平均每 batch 耗时，毫秒）
+  - 单样本延迟
+  - 吞吐量（samples/s）
+
+测量流程：
+  1. 注册 forward hook 统计一次前向的 MACs
+  2. 预热 warmup_steps 次（消除 JIT/CUDA 冷启动抖动）
+  3. 计时 measure_steps 次，取平均
+"""
+
 import time
 from typing import Any, Dict, Optional
 import numpy as np
@@ -13,8 +30,7 @@ def profile_model_inference(
     warmup_steps: int = 20,
     measure_steps: int = 100,
 ) -> Dict[str, Any]:
-    """
-    统一口径的推理性能评估。
+    """统一口径的推理性能评估。
 
     口径定义：
     1) 参数量: 所有可训练/不可训练参数总数
@@ -23,6 +39,16 @@ def profile_model_inference(
     4) 推理延迟: 当前 batch 的平均前向耗时(ms)
     5) 单样本延迟: batch 延迟 / batch_size
     6) 吞吐: batch_size / batch 延迟(s)
+
+    Args:
+        model: 待评测模型（eval 模式）
+        data_loader: 数据加载器，取第一个 batch 用于评测
+        device: 运行设备，None 时自动检测
+        warmup_steps: GPU 预热轮数，消除冷启动偏差
+        measure_steps: 正式计时轮数
+
+    Returns:
+        包含所有性能指标的字典
     """
     run_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -39,17 +65,19 @@ def profile_model_inference(
 
     params = int(sum(p.numel() for p in model.parameters()))
 
+    # 用闭包累加各层 MACs，hook 在一次前向后移除
     macs_counter = {"macs": 0}
     hooks = []
 
     def _linear_hook(module, inputs, output):
+        """Linear 层：MACs = batch_size * in_features * out_features"""
         in_tensor = inputs[0]
-        # [B, in_features] -> [B, out_features]
         cur_batch = int(in_tensor.shape[0])
         macs = cur_batch * int(module.in_features) * int(module.out_features)
         macs_counter["macs"] += macs
 
     def _conv_hook(module, inputs, output):
+        """Conv 层：MACs = batch_size * out_elements * (in_channels/groups * kernel_elems)"""
         in_tensor = inputs[0]
         cur_batch = int(in_tensor.shape[0])
 
@@ -70,6 +98,7 @@ def profile_model_inference(
         elif isinstance(m, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
             hooks.append(m.register_forward_hook(_conv_hook))
 
+    # 执行一次前向，收集 MACs 后立即移除 hook，避免影响后续计时
     with torch.inference_mode():
         _ = model(x)
 
@@ -81,9 +110,11 @@ def profile_model_inference(
     macs_per_sample = macs_per_batch / max(batch_size, 1)
     flops_per_sample = flops_per_batch / max(batch_size, 1)
 
+    # CUDA 同步确保 GPU 计算完成后再开始计时
     if run_device.startswith("cuda"):
         torch.cuda.synchronize()
 
+    # 预热阶段（不计时）
     with torch.inference_mode():
         for _ in range(max(warmup_steps, 0)):
             _ = model(x)
@@ -91,6 +122,7 @@ def profile_model_inference(
     if run_device.startswith("cuda"):
         torch.cuda.synchronize()
 
+    # 正式计时
     start = time.perf_counter()
     with torch.inference_mode():
         for _ in range(max(measure_steps, 1)):

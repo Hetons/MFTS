@@ -1,3 +1,27 @@
+"""
+TATIC easy-hard 联合分类评估脚本
+
+TATIC 三阶段分类的第三阶段：
+    Stage 1（easy_flow_modeling/main.py）：随机森林快速分类，输出 easy-flow 预测结果
+    Stage 2（hard_flow_modeling/main.py）：TCN 精细分类 hard-flow，保存模型权重
+    Stage 3（本脚本）：加载预训练 TCN，对 hard-flow 进行推理，合并 easy+hard 总体准确率
+
+联合评估逻辑：
+    - valid_pre_labels / valid_true_labels：来自 Stage 1 的 easy-flow 预测标签
+    - hard-flow 经 TCN 推理得到 y_predict_list / y_true_list
+    - 两部分结果拼接计算整体 balanced_accuracy_score
+
+输入文件（由 Stage 1 生成，存于 needdata/ 目录）：
+    {input_name}_valid_pre_true.csv  — easy valid 预测/真实标签对
+    {input_name}_test_pre_true.csv   — easy test 预测/真实标签对
+    {input_name}_valid_test_data.csv — hard-flow 序列特征
+
+命令行参数：
+    -model_name: 预训练 TCN 权重路径（.pth 文件）
+    -input_name: Stage 1 输出的文件名前缀
+    其余参数与 hard_flow_modeling/main.py 一致
+"""
+
 import argparse
 import csv
 import os
@@ -17,6 +41,7 @@ from util import profile_model_inference
 
 
 def print_profile_metrics(title: str, metrics: dict):
+    """格式化打印推理性能评估结果。"""
     print(f"\n=== {title} Inference Profile ===")
     print(f"Device: {metrics['device']}")
     print(f"Model param device: {metrics['model_param_device']}")
@@ -78,6 +103,15 @@ input_name = args.input_name
 
 
 def read_data(file_dir, seq_leng):
+    """读取 Stage 1 输出的 easy-flow 标签和 hard-flow 序列数据。
+
+    返回：
+        valid_data/valid_labels: hard-flow 的验证特征和标签
+        test_data/test_labels:   hard-flow 的测试特征和标签
+    全局变量：
+        valid_pre_labels/valid_true_labels: easy-flow 的验证预测/真实标签
+        test_pre_labels/test_true_labels:   easy-flow 的测试预测/真实标签
+    """
     global valid_pre_labels, test_pre_labels, valid_true_labels, test_true_labels
     valid_data = []
     valid_labels = []
@@ -87,7 +121,7 @@ def read_data(file_dir, seq_leng):
     birth_data1 = []
     with open(file_dir + input_name + "_valid_pre_true.csv") as csvfile1:
         tempvalid = csv.reader(csvfile1)
-        for row in tempvalid:  # load the data from get csv file into birth_data
+        for row in tempvalid:
             birth_data1.append(row)
     valid_pre_labels = np.array(birth_data1, "int32")[:, 0]
     valid_true_labels = np.array(birth_data1, "int32")[:, 1]
@@ -106,6 +140,8 @@ def read_data(file_dir, seq_leng):
         tempdata = csv.reader(csvfile3)
         for row in tempdata:
             birth_data3.append(row)
+
+    # 解析 hard-flow 序列（只取三元组中的包长分量 idx=3*i）
     temp_valid_data = np.array(birth_data3)[0]
     for id1, e in enumerate(temp_valid_data):
         try:
@@ -129,11 +165,11 @@ def read_data(file_dir, seq_leng):
         test_data.append(temp1)
         test_labels.append(int(birth_data3[3][id2]))
 
-    # print(test_data)
     return valid_data, valid_labels, test_data, test_labels
 
 
 def data_load(valid_data, valid_labels, test_data, test_labels, seq_leng):
+    """构建 valid/test DataLoader（只用于推理，无训练数据）。"""
     valid_dataloader = []
     test_dataloader = []
     valid_dataloader.append(
@@ -164,6 +200,7 @@ def data_load(valid_data, valid_labels, test_data, test_labels, seq_leng):
 
 
 def valid(model, device, valid_loader, i, loss_fn):
+    """验证集推理：输出 hard-flow 准确率，并合并 easy-flow 计算总体准确率。"""
     global valid_pre_labels, valid_true_labels
     model.eval()
     y_true = torch.LongTensor(0).to(device)
@@ -195,9 +232,9 @@ def valid(model, device, valid_loader, i, loss_fn):
         y_predict_trans = np.array(y_predict_list)
         acc = balanced_accuracy_score(y_true_trans, y_predict_trans)
         valid_acc = 100.0 * acc
+        # 合并 easy-flow 和 hard-flow 预测结果
         y_true_trans1 = np.array(y_true_list + list(valid_true_labels))
         y_predict_trans1 = np.array(y_predict_list + list(valid_pre_labels))
-        # sklearn report
         print(
             "Classification Report:\n",
             classification_report(y_true_trans1, y_predict_trans1, digits=4),
@@ -210,13 +247,13 @@ def valid(model, device, valid_loader, i, loss_fn):
             i, avg_loss, valid_acc1
         )
     )
-    # print model size
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total number of parameters: {total_params}")
     print("---------------------------------------------------")
 
 
 def test(model, device, test_loader, i, loss_fn):
+    """测试集推理：输出混淆矩阵，合并 easy+hard 总体准确率。"""
     global test_pre_labels, test_true_labels
     model.eval()
     y_true = torch.LongTensor(0).to(device)
@@ -251,6 +288,7 @@ def test(model, device, test_loader, i, loss_fn):
         acc = balanced_accuracy_score(y_true_trans, y_predict_trans)
         test_acc = 100.0 * acc
 
+        # 合并 easy+hard 完整测试集结果
         y_true_trans1 = np.array(y_true_list + list(test_true_labels))
         y_predict_trans1 = np.array(y_predict_list + list(test_pre_labels))
         matrix1 = confusion_matrix(np.array(y_true_trans1), np.array(y_predict_trans1))
@@ -271,6 +309,7 @@ if __name__ == "__main__":
     os.environ["CUDA_VISIBLE_DEVICES"] = CUDA_VISIBLE_DEVICES
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # 打印设备信息，便于排查 GPU/CPU 设备不一致问题
     print("=== Runtime Device Check ===")
     print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', '')}")
     print(f"torch.cuda.is_available(): {torch.cuda.is_available()}")
@@ -300,7 +339,7 @@ if __name__ == "__main__":
 
     criterion = torch.nn.CrossEntropyLoss()
 
-    # 使用 valid loader 做统一口径性能评估
+    # 用 valid loader 做统一口径性能评估（MACs / FLOPs / 延迟 / 吞吐）
     profile_metrics = profile_model_inference(
         model=model,
         data_loader=dataload[0],

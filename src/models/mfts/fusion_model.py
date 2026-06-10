@@ -1,3 +1,26 @@
+"""
+MFTS 两阶段融合模型（Multi-Feature Two-Stage Fusion）
+
+核心思路：
+    利用 TLS 握手特征的快速可用性（连接建立即可获取），
+    构建"快速路径 + 精细路径"的两阶段决策机制：
+
+        Stage 1（MFTS-early / 快速路径）：
+            基于 TLS 头部特征，使用轻量 CNN 实时预测。
+            若预测置信度 >= quick_ratio，直接输出结果（无需等待大量数据包）。
+
+        Stage 2（MFTS-refine / 精细路径）：
+            对置信度不足的样本，启用载荷 GNN 模型。
+            融合概率：final_prob = 0.6 * payload_prob + 0.4 * tls_prob
+
+    这种设计在大多数"容易"样本上节省 GNN 推理开销，
+    仅对"困难"样本（低置信度）调用精细模型，平衡延迟与准确率。
+
+FusionModelDataset 说明：
+    同时加载载荷图数据（X/edges/edge_attr）和 TLS 序列数据（T），
+    返回 (payload_data, tls_x, y) 三元组，供融合评估使用。
+"""
+
 import torch
 import torch.nn as nn
 import os
@@ -20,6 +43,16 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class FusionModelDataset(Dataset):
+    """联合数据集：同一目录下同时加载载荷图数据和 TLS 序列数据。
+
+    通过维护两个子数据集（payload 和 tls）并对齐索引，
+    确保同一样本的两种模态特征能被一起取出。
+
+    Args:
+        root_dir: 包含 X_*.npy 和 T_*.npy 的数据目录
+        num_classes: 分类类别数
+    """
+
     def __init__(self, root_dir: str, num_classes: int):
         self.payload_dataset = PayloadShardedGraphDataset(
             root=root_dir, num_classes=num_classes
@@ -30,12 +63,26 @@ class FusionModelDataset(Dataset):
         return len(self.payload_dataset)
 
     def __getitem__(self, idx):
-        payload_data = self.payload_dataset[idx]
-        tls_data_x, y = self.tls_dataset[idx]
+        payload_data = self.payload_dataset[idx]  # PyG Data 对象（图结构）
+        tls_data_x, y = self.tls_dataset[idx]     # TLS 序列张量 + 标签
         return payload_data, tls_data_x, y
 
 
 class FusionModel(nn.Module):
+    """MFTS 两阶段融合模型，封装 TLS 早期模型和载荷精细模型。
+
+    本类在初始化时从磁盘加载两个预训练模型，推理时通过
+    quick_ratio 阈值动态路由到快速分支或精细分支。
+
+    注意：本类的 forward 未实现（推理逻辑在 __main__ 中展开），
+    仅作为模型容器提供 tls_model 和 payload_model 属性。
+
+    Args:
+        quick_ratio: TLS 快速分支的置信度阈值（默认 0.99）
+        tls_model_path: MftsEarlyModel 的 checkpoint 路径
+        payload_model_path: MtfsRefineModel 的 checkpoint 路径
+    """
+
     def __init__(
         self,
         quick_ratio: float = 0.99,
@@ -51,7 +98,8 @@ class FusionModel(nn.Module):
     def _load_models(
         self, payload_model_path: str, tls_model_path: str
     ) -> tuple[MftsEarlyModel, MtfsRefineModel]:
-        # Load TLS model
+        """从 checkpoint 还原两个子模型并移至目标设备。"""
+        # 加载 TLS 早期模型
         tls_ckpt = torch.load(tls_model_path, map_location=device, weights_only=False)
         tls_model = MftsEarlyModel(
             class_num=tls_ckpt["config"]["num_classes"],
@@ -61,7 +109,7 @@ class FusionModel(nn.Module):
         ).to(device)
         tls_model.load_state_dict(tls_ckpt["model_state_dict"])
 
-        # Load Payload model
+        # 加载载荷精细模型
         payload_ckpt = torch.load(
             payload_model_path, map_location=device, weights_only=False
         )
@@ -78,6 +126,13 @@ class FusionModel(nn.Module):
 
 
 class ValLoaderView:
+    """将三元组 DataLoader 适配为指定分支的二元组迭代格式，供单模型性能评测使用。
+
+    Args:
+        base_loader: 返回 (payload_batch, tls_batch, y) 的 DataLoader
+        branch: 'tls' 或 'payload'，决定返回哪路数据
+    """
+
     def __init__(self, base_loader, branch: str):
         self.base_loader = base_loader
         self.branch = branch
@@ -96,6 +151,8 @@ class ValLoaderView:
 
 
 class PayloadForwardWrapper(nn.Module):
+    """将 MtfsRefineModel 包装为接受单个 PyG batch 的接口，供 profile_model_inference 使用。"""
+
     def __init__(self, payload_model: nn.Module):
         super().__init__()
         self.payload_model = payload_model
@@ -110,6 +167,7 @@ class PayloadForwardWrapper(nn.Module):
 
 
 def print_profile_metrics(title: str, metrics: dict):
+    """格式化输出性能指标，title 用于区分 TLS/Payload 分支。"""
     print(f"\n=== {title} Inference Profile ===")
     print(f"Device: {metrics['device']}")
     print(f"Batch size: {metrics['batch_size']}")
@@ -137,7 +195,7 @@ if __name__ == "__main__":
         payload_model_path="/home/tyf/Project/Tantic/checkpoints/mfts_payload_gnn_model.pth",
     )
 
-    # ==================== 性能评估（基于 val_loader） ====================
+    # ==================== 推理性能评估 ====================
     tls_profile_loader = ValLoaderView(val_loader, branch="tls")
     payload_profile_loader = ValLoaderView(val_loader, branch="payload")
 
@@ -159,7 +217,7 @@ if __name__ == "__main__":
     )
     print_profile_metrics("MFTS-refine Evaluation", payload_profile)
 
-    # ==================== Payload-only 评估 ====================
+    # ==================== 载荷精细模型单独评估 ====================
     print("\n=== MFTS-refine Evaluation ===")
     payload_preds, payload_trues = [], []
     model.payload_model.eval()
@@ -184,7 +242,7 @@ if __name__ == "__main__":
         classification_report(payload_trues, payload_preds, digits=4, zero_division=0)
     )
 
-    # ==================== TLS-only 评估 ====================
+    # ==================== TLS 早期模型单独评估 ====================
     print("\n=== MFTS-early Evaluation ===")
     tls_preds, tls_trues = [], []
     model.tls_model.eval()
@@ -202,7 +260,7 @@ if __name__ == "__main__":
     print(f"Accuracy: {tls_acc:.4f}")
     print(classification_report(tls_trues, tls_preds, digits=4, zero_division=0))
 
-    # ==================== Fusion 评估 ====================
+    # ==================== 融合评估（两阶段决策） ====================
     print("\n=== Fusion Evaluation ===")
     fusion_preds, fusion_trues = [], []
     quick_selected, total_samples = 0, 0
@@ -218,23 +276,21 @@ if __name__ == "__main__":
             batch_size = batch_y.size(0)
             total_samples += batch_size
 
-            # TLS 预测
+            # Stage 1：TLS 快速预测
             tls_pred = model.tls_model(batch_tls)
             tls_probs = torch.softmax(tls_pred, dim=1)
             max_probs, _ = torch.max(tls_probs, dim=1)
 
-            # 快速分支判断
+            # 置信度高的样本走快速分支，直接使用 TLS 预测结果
             quick_mask = max_probs >= model.quick_ratio
             quick_selected += quick_mask.sum().item()
 
-            # 初始化预测
             final_pred = torch.zeros(batch_size, dtype=torch.long, device=device)
 
-            # 快速分支：直接用 TLS
             if quick_mask.any():
                 final_pred[quick_mask] = tls_pred[quick_mask].argmax(dim=1)
 
-            # 慢速分支：融合 TLS 和 Payload
+            # Stage 2：置信度不足的样本进入精细分支
             if (~quick_mask).any():
                 payload_pred = model.payload_model(
                     batch_payload.x,
@@ -243,6 +299,8 @@ if __name__ == "__main__":
                     batch_payload.batch,
                 )
                 payload_probs = torch.softmax(payload_pred, dim=1)
+                # 融合概率：载荷模型权重 0.6，TLS 权重 0.4
+                # 载荷权重更高是因为其包含更丰富的流量模式信息
                 fused_probs = (
                     0.6 * payload_probs[~quick_mask] + 0.4 * tls_probs[~quick_mask]
                 )
@@ -277,7 +335,7 @@ if __name__ == "__main__":
         f"\nTLS quick-branch: {quick_selected}/{total_samples} ({quick_selected/total_samples:.2%})"
     )
 
-    # ==================== 性能对比总结 ====================
+    # ==================== 性能对比汇总 ====================
     print("\n" + "=" * 70)
     print("Performance Comparison")
     print("=" * 70)
@@ -296,8 +354,3 @@ if __name__ == "__main__":
         print(
             f"Slow-branch accuracy:  {slow_correct/slow_total:.4f} (on {slow_total} samples)"
         )
-
-    # save y_pred and y_true for further analysis
-    # os.makedirs(f"{root_dir}/result", exist_ok=True)
-    # np.save(f"{root_dir}/result/fusion_y_true.npy", fusion_trues)
-    # np.save(f"{root_dir}/result/fusion_y_pred.npy", fusion_preds)

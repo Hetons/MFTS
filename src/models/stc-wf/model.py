@@ -1,3 +1,22 @@
+"""
+STC-WF: Spatio-Temporal Graph Convolutional Network for Website Fingerprinting
+
+模型结构：
+    GATv2Conv (多头图注意力，聚合邻域 + 融合边特征)
+    → GraphNorm + ELU
+    → GATv2Conv (进一步提取高阶结构信息)
+    → GraphNorm + ELU
+    → SAGPooling (基于注意力打分保留重要节点，压缩图规模)
+    → global_mean_pool (图级平均聚合)
+    → MLP 分类头
+
+输入数据格式：
+    每个样本对应一张图，节点为 TCP 流，边反映流之间的时空相关性。
+    节点特征：包长序列 + 统计特征 (shape: [num_nodes, in_dim])
+    边特征：[目的 IP 相似度, 时间衰减权重] (shape: [num_edges, 2])
+    标签：网站类别 ID (0..16)
+"""
+
 from ast import Tuple
 import os, glob
 from tracemalloc import start
@@ -22,14 +41,30 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class ShardedGraphDataset(Dataset):
+    """分片图数据集，支持内存映射加载大规模 .npy 文件。
+
+    数据组织：每个 shard 包含 N 个样本，对应文件：
+        X_{sid:03d}.npy       — 节点特征矩阵 [N, M, D]
+        y_{sid:03d}.npy       — 标签 [N]
+        edges_{sid:03d}.npy   — 所有样本边的连接 [2, total_E]
+        edge_ptr_{sid:03d}.npy — 每个样本边的起止指针 [N+1]
+        edge_attr_{sid:03d}.npy — 边属性 [total_E, 2]
+
+    Args:
+        root: 包含 .npy 分片文件的根目录
+        num_classes: 分类类别数，用于标签范围断言
+    """
+
     def __init__(self, root, num_classes: int = 17):
         self.root = root
+        # 自动发现所有 X_*.npy 分片并提取 shard id，保持顺序一致
         self.shard_ids = sorted(
             [
                 int(os.path.basename(p).split("_")[1].split(".")[0])
                 for p in glob.glob(os.path.join(root, "X_*.npy"))
             ]
         )
+        # 构建全局索引：(shard_id, 样本在该 shard 中的下标)
         self.index = []
         for sid in self.shard_ids:
             x = np.load(os.path.join(root, f"X_{sid:03d}.npy"), mmap_mode="r")
@@ -42,6 +77,7 @@ class ShardedGraphDataset(Dataset):
         return len(self.index)
 
     def _load_shard(self, sid):
+        """单 shard 懒加载缓存：只保留最近一个 shard，避免 OOM。"""
         if self._cache.get("sid") != sid:
             self._cache = {
                 "sid": sid,
@@ -60,17 +96,17 @@ class ShardedGraphDataset(Dataset):
         shard = self._load_shard(sid)
         x = torch.from_numpy(shard["X"][i]).float()
         ptr = shard["ptr"]
+        # edge_ptr 是累积指针，ptr[i]:ptr[i+1] 切出第 i 个图的所有边
         e = shard["edges"][:, ptr[i] : ptr[i + 1]]
         edge_index = torch.from_numpy(e).long()
         edge_attr = torch.from_numpy(shard["edge_attr"][ptr[i] : ptr[i + 1]]).float()
         y = shard["y"][i]
         y = int(np.asarray(y).squeeze())  # 兼容 y 形状为 (1,)
 
-        # 清理 x 全为 0 的行 todo(tyf)
+        # 移除全零节点行（padding 产生的哑节点，不含有效特征）
         non_zero_mask = x.abs().sum(dim=1) != 0
         x = x[non_zero_mask]
 
-        # ✅ 添加断言检查标签范围
         assert 0 <= y <= self.num_classes, f"Label {y} out of range [0,13] at idx {idx}"
 
         return Data(
@@ -82,6 +118,18 @@ class ShardedGraphDataset(Dataset):
 
 
 class DataLoaderBuilder:
+    """构建训练/验证 DataLoader，同时计算类别权重用于不平衡采样。
+
+    划分策略：按标签分层抽样，训练:验证 = (1-ratio):ratio，
+    首次运行后将索引保存到磁盘，后续直接复用以保证可复现性。
+
+    Args:
+        root: 数据集根目录
+        num_classes: 类别数
+        batch_size: 每批样本数
+        test_dataset_ratio: 验证集比例
+    """
+
     def __init__(
         self,
         root: str,
@@ -91,9 +139,9 @@ class DataLoaderBuilder:
     ):
         self.num_classes = num_classes
         dataset = ShardedGraphDataset(root, num_classes=num_classes)
-        # 切分训练集和验证集 8 : 2
         from sklearn.model_selection import train_test_split
 
+        # 优先从磁盘恢复划分，保证多次运行训练/验证集一致
         if os.path.exists(f"{root}/train_idx.npy") and os.path.exists(
             f"{root}/val_idx.npy"
         ):
@@ -106,11 +154,9 @@ class DataLoaderBuilder:
             train_idx, val_idx = train_test_split(
                 idx, test_size=test_dataset_ratio, random_state=42, stratify=labels
             )
-            # 保存
             np.save(f"{root}/train_idx.npy", train_idx)
             np.save(f"{root}/val_idx.npy", val_idx)
 
-        # 使用
         train_dataset = torch.utils.data.Subset(dataset, train_idx)
         val_dataset = torch.utils.data.Subset(dataset, val_idx)
 
@@ -124,10 +170,10 @@ class DataLoaderBuilder:
         )
         self.val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-        # calc weighted class weights
+        # 计算反频率加权：类别频率越低，权重越高，缓解类别不平衡
         label_counts = np.zeros(num_classes, dtype=np.int64)
         for data in train_dataset:
-            label_counts[data.y.item()] += 1  # labels are 0..16
+            label_counts[data.y.item()] += 1
         total_counts = label_counts.sum()
         class_weights = total_counts / (num_classes * np.maximum(label_counts, 1))
         class_weights = torch.from_numpy(class_weights).float().to(device)
@@ -147,6 +193,26 @@ class DataLoaderBuilder:
 
 
 class StcWfModel(torch.nn.Module):
+    """基于图注意力网络（GATv2）的网站指纹识别模型。
+
+    结构概述：
+        conv1: GATv2Conv  — 多头注意力，将节点特征从 in_dim 映射到 hidden_dim*heads，
+                            融合边特征（边的目标 IP 相似度 + 时间衰减权重）
+        conv2: GATv2Conv  — 单头注意力，进一步提取图结构信息
+        sag_pooling: SAGPooling — 基于可学习注意力分数保留 ratio 比例的重要节点，
+                                  减少图中噪声节点的干扰
+        global_mean_pool  — 对保留节点做均值聚合，得到固定长度图级表示
+        mlp: Linear-ELU-Dropout-Linear — 映射到类别空间
+
+    Args:
+        in_dim: 节点输入特征维度
+        hidden_dim: 每个注意力头的隐藏维度
+        num_classes: 分类类别数
+        heads: 第一层 GATv2 的注意力头数
+        dropout_param: Dropout 概率
+        sag_pool_ratio: SAGPooling 保留节点的比例 (0, 1]
+    """
+
     def __init__(
         self,
         in_dim,
@@ -157,13 +223,15 @@ class StcWfModel(torch.nn.Module):
         sag_pool_ratio=0.5,
     ):
         super().__init__()
+        # 第一层：多头注意力 + 边特征融合，输出维度 hidden_dim*heads
         self.conv1 = GATv2Conv(
             in_dim,
             hidden_dim,
             heads=heads,
             dropout=dropout_param,
-            edge_dim=2,
+            edge_dim=2,          # 边特征：[IP相似度, 时间衰减]
         )
+        # 第二层：单头注意力，输出维度 hidden_dim
         self.conv2 = GATv2Conv(
             hidden_dim * heads,
             hidden_dim,
@@ -175,6 +243,7 @@ class StcWfModel(torch.nn.Module):
         self.dropout_param = dropout_param
         self.norm1 = GraphNorm(hidden_dim * heads)
         self.norm2 = GraphNorm(hidden_dim)
+        # 分类 MLP：hidden_dim → hidden_dim → num_classes
         self.mlp = torch.nn.Sequential(
             torch.nn.Linear(hidden_dim, hidden_dim),
             torch.nn.ELU(),
@@ -182,24 +251,47 @@ class StcWfModel(torch.nn.Module):
             torch.nn.Linear(hidden_dim, num_classes),
         )
         self.sag_pool_ratio = sag_pool_ratio
+        # SAGPooling 用注意力分数打分，丢弃低分节点，减少噪声流的影响
         self.sag_pooling = SAGPooling(hidden_dim, ratio=self.sag_pool_ratio)
 
     def forward(self, x, edge_index, edge_attr, batch):
+        """
+        Args:
+            x: 节点特征 [num_nodes, in_dim]
+            edge_index: 边连接 [2, num_edges]
+            edge_attr: 边特征 [num_edges, 2]
+            batch: 批次索引 [num_nodes]，标识每个节点属于哪张图
+        Returns:
+            logits: 分类 logits [batch_size, num_classes]
+        """
+        # 第 1 层图注意力：局部邻域聚合
         x = self.conv1(x, edge_index, edge_attr)
         x = self.norm1(x)
         x = F.elu(x)
 
+        # 第 2 层图注意力：提取更高阶结构信息
         x = self.conv2(x, edge_index, edge_attr)
         x = self.norm2(x)
         x = F.elu(x)
 
+        # SAGPooling 结构压缩：丢弃不重要节点，保留关键流信息
         x, edge_index, _, batch, _, _ = self.sag_pooling(x, edge_index, None, batch)
+        # 全局平均池化：将可变大小图压缩为固定维度向量
         x = global_mean_pool(x, batch)
 
         return self.mlp(x)
 
 
 class Evaluator:
+    """模型评估器，提供快速准确率计算和详细分类报告。
+
+    Args:
+        model: 待评估的 StcWfModel 实例
+        loader: 验证集 DataLoader
+        device: 计算设备
+        num_classes: 类别数
+    """
+
     def __init__(self, model, loader, device, num_classes):
         self.model = model
         self.loader = loader
@@ -207,6 +299,7 @@ class Evaluator:
         self.num_classes = num_classes
 
     def quick_evaluate(self) -> float:
+        """快速计算整体准确率（Top-1），不生成详细报告，适合训练中监控。"""
         correct = 0
         total = 0
         self.model.eval()
@@ -223,6 +316,13 @@ class Evaluator:
         return accuracy
 
     def evaluate(self):
+        """详细评估：返回准确率、per-class 分类报告和混淆矩阵。
+
+        Returns:
+            accuracy: 整体准确率
+            report: sklearn classification_report 字符串
+            cm: 混淆矩阵 ndarray [num_classes, num_classes]
+        """
         from sklearn.metrics import classification_report
 
         self.model.eval()
@@ -240,7 +340,6 @@ class Evaluator:
         y_pred = np.concatenate(preds)
         y_true = np.concatenate(trues)
 
-        # 生成分类报告
         target_names = [f"Class_{i}" for i in range(self.num_classes)]
         report = classification_report(
             y_true, y_pred, target_names=target_names, digits=4, zero_division=0
@@ -250,8 +349,8 @@ class Evaluator:
         cm = self._compute_confusion_matrix()
         return accuracy, report, cm
 
-    # 混淆矩阵
     def _compute_confusion_matrix(self):
+        """计算混淆矩阵，用于可视化各类别间的误分布。"""
         from sklearn.metrics import confusion_matrix
 
         self.model.eval()
@@ -273,6 +372,8 @@ class Evaluator:
 
 
 class ProfileLoaderView:
+    """将 PyG DataLoader 适配为 (batch, label) 二元组迭代格式，供性能评测使用。"""
+
     def __init__(self, base_loader):
         self.base_loader = base_loader
 
@@ -285,6 +386,8 @@ class ProfileLoaderView:
 
 
 class ProfileForwardWrapper(torch.nn.Module):
+    """将图模型包装为接受单个 batch 对象的前向接口，配合 profile_model_inference 使用。"""
+
     def __init__(self, model: torch.nn.Module):
         super().__init__()
         self.model = model
@@ -294,6 +397,7 @@ class ProfileForwardWrapper(torch.nn.Module):
 
 
 def print_profile_metrics(metrics: dict):
+    """格式化输出 profile_model_inference 返回的性能指标。"""
     print("\n=== Inference Profile (utils.profile_model_inference) ===")
     print(f"Device: {metrics['device']}")
     print(f"Batch size: {metrics['batch_size']}")
@@ -308,6 +412,18 @@ def print_profile_metrics(metrics: dict):
 
 
 def train_and_save_model(root: str, open_save: bool = False, save_path: str = ""):
+    """完整训练一轮并保存最优模型权重。
+
+    训练策略：
+        - Adam 优化器，加权 CrossEntropy 损失（缓解类别不平衡）
+        - 每 epoch 结束后在验证集上快速评估，保存历史最优 state_dict
+        - 训练 100 epoch，通过 global 变量跨轮次维护最优状态
+
+    Args:
+        root: 数据集根目录（已由外部 loader_builder 加载）
+        open_save: 是否保存模型到磁盘
+        save_path: 模型保存路径
+    """
     global best_acc_val, best_state_dict
     num_classes = 17
     train_loader, val_loader = loader_builder.get_all_loader()
@@ -327,7 +443,6 @@ def train_and_save_model(root: str, open_save: bool = False, save_path: str = ""
         dropout_param=search_dropout,
     ).to(device)
 
-    # 计算模型参数量
     total_params = sum(p.numel() for p in model.parameters())
     import copy
 
@@ -352,10 +467,7 @@ def train_and_save_model(root: str, open_save: bool = False, save_path: str = ""
     print(
         f"Best Validation Accuracy: {best_acc_val:.4f}, Total Parameters: {total_params}"
     )
-    # print("\n=== Classification Report ===")
-    # print(report)
 
-    # save model
     if open_save:
         save_path = save_path
         torch.save(
@@ -376,7 +488,6 @@ def train_and_save_model(root: str, open_save: bool = False, save_path: str = ""
 
 if __name__ == "__main__":
 
-    # 获取命令行参数
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
@@ -399,18 +510,19 @@ if __name__ == "__main__":
     root = args.dataset_folder
     loader_builder = DataLoaderBuilder(root, num_classes=17, batch_size=512)
     model_save_path = args.model_save_path
+
     if args.model == "train":
+        # 多轮训练取最优：每轮随机初始化，全局保留最优验证准确率的权重
         best_acc_val = float(0.0)
         best_state_dict = None
         for i in range(5):
             print(f"--- Training Round {i+1} ---")
             train_and_save_model(root, save_path=model_save_path, open_save=True)
-        # output val_acc
         print(
             f"Best Validation Accuracy: {best_acc_val:.4f}, starting detailed evaluation..."
         )
     elif args.model == "eval":
-        # load model and evaluate detailed
+        # 加载已保存的 checkpoint 并进行推理性能 + 分类精度评估
         payload_model_check_point = torch.load(model_save_path)
         payload_model = StcWfModel(
             in_dim=payload_model_check_point["config"]["in_dim"],
@@ -421,7 +533,7 @@ if __name__ == "__main__":
         ).to(device)
         payload_model.load_state_dict(payload_model_check_point["model_state_dict"])
 
-        # 性能评估
+        # 推理性能评估（MACs / 延迟 / 吞吐）
         profile_metrics = profile_model_inference(
             model=ProfileForwardWrapper(payload_model),
             data_loader=cast(Any, ProfileLoaderView(loader_builder.val_loader)),
@@ -431,7 +543,7 @@ if __name__ == "__main__":
         )
         print_profile_metrics(profile_metrics)
 
-        # 准确率评估
+        # 分类准确率 + per-class 报告 + 混淆矩阵
         evaluator = Evaluator(
             payload_model,
             loader_builder.val_loader,

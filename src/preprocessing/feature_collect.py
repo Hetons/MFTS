@@ -1,4 +1,29 @@
-# Encoding TLS features: one-hot for certain fields, others to int and save as matrix
+"""
+特征采集模块
+
+将原始 pcap 文件转换为模型可用的张量特征，支持三种采集器：
+    - STGCGraphTensorCollector: MFTS 图特征（节点特征 + 边结构 + TLS 序列）
+    - CUMULTensorCollector: CUMUL 包长序列特征
+    - TaticTensorCollector: TATIC 流级特征（包长 + 窗口大小 + 时间差交叉拼接）
+
+边构建策略（EdgeIndexBuilder）：
+    - fully_connected: 所有流之间两两建边，O(M²) 复杂度
+    - spatio_temporal: 基于时间窗口的时空边
+        同一时间窗口（cluster）内的流建双向边，相邻窗口间建单向边（时间顺序）
+        边属性：[IP 网段相似度, exp(-|time_diff|)]
+
+STGCGraphTensorCollector 节点特征（每个节点 = 一条 TCP 流）：
+    维度 = packet_nums_padding + 6
+    前 L 维：包长序列（归一化到 [0, 1]，除以 1500）
+    后 6 维：统计特征 [umax, alen, uper9, dlen, dper8, dmean]
+        umax:  上行包最大长度
+        alen:  所有包绝对长度之和
+        uper9: 上行包 90 分位长度
+        dlen:  下行包总长度
+        dper8: 下行包 80 分位长度
+        dmean: 下行包均值
+"""
+
 import os
 from struct import pack
 import numpy as np
@@ -12,6 +37,15 @@ import logging
 
 
 class EdgeIndexBuilder:
+    """图边构建器，支持 fully_connected 和 spatio_temporal 两种策略。
+
+    Args:
+        flows: 流字典列表，每个元素含 flow_start_time 和 dst_ip 字段
+        add_self_loops: 是否添加自环边（有助于保留节点自身信息）
+        undirected: 是否将有向边转换为无向边（同时添加反向边）
+        method: 边构建方法，'fully_connected' 或 'spatio_temporal'
+    """
+
     def __init__(
         self,
         flows: list[dict],
@@ -25,12 +59,18 @@ class EdgeIndexBuilder:
         self.method = method
 
     def build_edges(self, method=None, **kwargs):
+        """构建边索引和边属性。
+
+        Returns:
+            edge_index: shape (2, E)，int64
+            edge_attr: shape (E, 2)，float32，每条边的 [IP相似度, 时间衰减]
+        """
         method = self.method if method is None else method
         edge_attr = np.zeros((0, 2), dtype=np.float32)
         if method == "fully_connected":
             edge_index, edge_attr = self.__build_edges_fully_connected()
         elif method == "spatio_temporal":
-            self.undirected = False  # 强制设为有向图
+            self.undirected = False  # 时空边本身是有向的，不做无向化
             edge_index, edge_attr = self.__build_edges_spatio_temporal(
                 threshold=kwargs.get("threshold", 0.3)
             )
@@ -38,12 +78,13 @@ class EdgeIndexBuilder:
             raise ValueError(f"Unknown edge building method: {method}")
 
         if self.undirected:
-            # 无向化：加反向边
+            # 无向化：为每条边添加反向边，属性复制
             edge_index = np.hstack([edge_index, edge_index[::-1]])
             edge_attr = edge_attr.reshape(-1, 2)
-            edge_attr = np.vstack([edge_attr, edge_attr])  # 无向化时也扩展属性
+            edge_attr = np.vstack([edge_attr, edge_attr])
 
         if self.add_self_loops:
+            # 自环：节点指向自身，属性 [1.0, 1.0]（IP 相同，时间差为 0）
             M = len(self.flows)
             self_loops = np.array([range(M), range(M)], dtype=np.int64)
             edge_index = np.hstack([edge_index, self_loops])
@@ -55,6 +96,23 @@ class EdgeIndexBuilder:
     def __build_edges_spatio_temporal(
         self, threshold=0.3
     ) -> tuple[np.ndarray, np.ndarray]:
+        """时空边构建：基于时间窗口划分簇，簇内建双向边，相邻簇间建单向边。
+
+        时间窗口逻辑：
+            从第 0 个流开始，将时间差 <= threshold 的连续流划为同一 span（时间簇），
+            span 内任意两流之间建双向边（捕捉同时发起的并发请求）；
+            相邻 span 间建单向边（按时间顺序，反映页面加载的先后依赖）。
+
+        边属性：
+            [IP相似度, 时间衰减] = [float(同/24子网), exp(-|t_j - t_i|)]
+
+        Args:
+            threshold: 时间窗口宽度（秒），默认 0.3s
+
+        Returns:
+            edge_index: (2, E)
+            edge_attr: (E, 2)
+        """
         start_times = np.array(
             [flow.get("flow_start_time", 0.0) for flow in self.flows],
             dtype=np.float64,
@@ -63,10 +121,11 @@ class EdgeIndexBuilder:
             [flow.get("dst_ip", "") for flow in self.flows],
             dtype=np.str_,
         )
-        # check cidr /24 相同
+        # 检查 /24 子网是否相同（通过去掉最后一段 IP 比较）
         check_dst = (
             lambda i, j: dst_ip[i].rsplit(".", 1)[0] == dst_ip[j].rsplit(".", 1)[0]
         )
+        # 边属性：[完全相同IP or /24相同, 时间衰减（越近权重越高）]
         build_edge_attr = lambda i, j: [
             float(dst_ip[j] == dst_ip[i] or check_dst(i, j)),
             math.exp(-abs(start_times[j] - start_times[i])),
@@ -86,15 +145,14 @@ class EdgeIndexBuilder:
             span.append((windows_start, windows_end))
             idx = windows_end + 1
 
-        # span 内建立双向边，span间建立单向边
         for i in range(len(span)):
             s_i, e_i = span[i]
-            # span 内双向边
+            # span 内：全连接双向边（捕捉同时发起的并发流）
             for m, n in permutations(range(s_i, e_i + 1), 2):
                 src.append(m)
                 dst.append(n)
                 edge_attr.append(build_edge_attr(m, n))
-            # span 间单向边
+            # 相邻 span 间：单向边（上一批流 → 下一批流，反映时序依赖）
             if i + 1 < len(span):
                 s_j, e_j = span[i + 1]
                 for m in range(s_i, e_i + 1):
@@ -108,6 +166,10 @@ class EdgeIndexBuilder:
         )
 
     def __build_edges_fully_connected(self):
+        """全连接边构建：所有流对（i≠j）之间建有向边。
+
+        时间复杂度 O(M²)，适合流数量较少的场景。
+        """
         M = len(self.flows)
         src, dst = [], []
         start_times = np.array(
@@ -137,26 +199,36 @@ class EdgeIndexBuilder:
 
 
 class TLSHeaderTensorCollector:
-    def __init__(self, threshold: float = 0.3):
-        """_summary_
+    """TLS 握手头部特征采集器，在时间窗口内提取 TLS 元数据序列。
 
-        Args:
-            threshold (float, optional): The time threshold. Defaults to 0.3.
-        """
+    Args:
+        threshold: 时间窗口宽度（秒），只提取 [flow_start, flow_start+threshold] 内的流
+    """
+
+    def __init__(self, threshold: float = 0.3):
         self.threshold = threshold
 
     def _do_collect(self, flows: dict, tls_node_padding: int) -> np.ndarray:
-        # 按照 flow_start_time 排序并过滤时间窗口内的 flows
+        """提取时间窗口内的 TLS 特征序列并补零/截断到 tls_node_padding 长度。
+
+        Args:
+            flows: 原始流字典（键为流 ID 字符串）
+            tls_node_padding: TLS 序列固定长度
+
+        Returns:
+            T_i: shape (tls_node_padding, D_tls) 的 float32 数组
+        """
         flows_list = sorted(flows.values(), key=lambda x: x.get("flow_start_time", 0.0))
 
         if flows_list:
             threshold_time = flows_list[0].get("flow_start_time", 0.0) + self.threshold
+            # 只保留时间窗口内的流（早期 TLS 握手信号）
             flows_list = [
                 f for f in flows_list if f.get("flow_start_time", 0.0) <= threshold_time
             ]
             T_i = encode_tls_features(flows_list, threshold_time)
 
-        # padding or truncate to fixed tls_node_padding, dim = 0
+        # 补零或截断到固定节点数
         if T_i.shape[0] < tls_node_padding:
             T_i = np.vstack(
                 [T_i, np.zeros((tls_node_padding - T_i.shape[0], T_i.shape[1]))]
@@ -168,13 +240,20 @@ class TLSHeaderTensorCollector:
 
 
 class TensorCollector:
+    """特征采集器基类，定义接口规范。
+
+    Args:
+        sample_file_dir: 原始数据目录（包含多个 website_name/instance_id/traffic.pcap 文件）
+    """
+
     def __init__(
         self,
-        sample_file_dir: str = "",  # sample files director
+        sample_file_dir: str = "",
     ):
         self.sample_file_dir = sample_file_dir
 
     def get_meta(self) -> dict[str, object]:
+        """返回采集器元数据，记录数据来源和采集参数。"""
         return {
             "created_by": self.__class__.__name__,
             "created_time": str(np.datetime64("now")),
@@ -182,10 +261,21 @@ class TensorCollector:
         }
 
     def sample_iter(self):
+        """迭代产出样本，子类必须实现此方法。"""
         raise NotImplementedError
 
 
 class TaticTensorCollector(TensorCollector):
+    """TATIC 模型特征采集器。
+
+    节点特征（每条流）：[包长序列, 窗口大小序列, 时间差序列] 交叉拼接
+    维度 = 3 * packet_nums_padding
+
+    Args:
+        sample_file_dir: 原始数据目录
+        packet_nums_padding: 每流保留的最大包数
+    """
+
     def __init__(self, sample_file_dir: str = "", packet_nums_padding=100):
         super().__init__(sample_file_dir)
         self.packet_nums_padding = packet_nums_padding
@@ -206,13 +296,21 @@ class TaticTensorCollector(TensorCollector):
         packet_nums_padding: int,
         website_id: int,
     ) -> tuple[list, list, list]:
+        """提取每条流的交叉特征序列。
+
+        交叉拼接格式：[pkt[0], win[0], time_diff[0], pkt[1], win[1], time_diff[1], ...]
+        这种格式将同一包的三个属性紧挨排列，便于 1D 卷积捕捉局部相关性。
+
+        Returns:
+            X_i: list of list，每条流的特征向量
+            T_i: list of float，每条流的起始时间
+            Y_i: list of int，标签列表（所有流共享同一 website_id）
+        """
         flow_nums = len(flows)
-        # 提取每个流的包长序列
         packet_lengths = [flow.get("packet_length", []) for flow in flows.values()]
         packet_window_size = [flow.get("window_size", []) for flow in flows.values()]
         packet_times = [flow.get("timestamp", []) for flow in flows.values()]
         flow_start_times = [flow.get("flow_start_time", 0.0) for flow in flows.values()]
-        # packet times, diff with previous packet
 
         X_i = []
         T_i = []
@@ -224,31 +322,29 @@ class TaticTensorCollector(TensorCollector):
                 packet_window_size[i], packet_nums_padding, pad_value=0.0
             )
 
-            # ✓ 安全处理空时间戳
             if len(packet_times[i]) > 1:
                 packet_diff_times = [0.0] + np.diff(packet_times[i]).tolist()
             else:
-                # For 0 or 1 packets, the time diff sequence is padded with zeros later.
                 packet_diff_times = [0.0] * len(packet_times[i])
 
             packet_times_diff = pad_trunc_1d(
                 packet_diff_times, packet_nums_padding, pad_value=0.0
             )
 
-            # ✓ 交叉构建：[pkt[0], win[0], time[0], pkt[1], win[1], time[1], ...]
+            # column_stack + flatten 实现交叉拼接：[pkt, win, time] × L → 3L 维向量
             stacked = np.column_stack(
                 [pkt_len_seq, packet_window_size_seq, packet_times_diff]
             )
-            interleaved = stacked.flatten()  # 形状: (3*packet_nums_padding,)
+            interleaved = stacked.flatten()
 
-            X_i.append(interleaved.tolist())  # ✓ 转换为 list 保持一致性
-            T_i.append(flow_start_times[i])  # ✓ 使用实际的 flow_start_time 作为 T_i
-        # ✓ 使用实际处理后的数量
+            X_i.append(interleaved.tolist())
+            T_i.append(flow_start_times[i])
         Y_i = len(X_i) * [website_id]
         return X_i, T_i, Y_i
 
     @override
     def sample_iter(self):
+        """遍历目录树，对每个 instance 提取 TATIC 特征并 yield。"""
         idx = 1
         website_idx = -1
         for website_name in os.listdir(self.sample_file_dir):
@@ -261,7 +357,6 @@ class TaticTensorCollector(TensorCollector):
                 data_dir = os.path.join(website_folder, instance_id)
                 if not os.path.isdir(data_dir):
                     continue
-                # Find pcap file and summary file
                 pcap_file = None
                 summary_file = None
                 for filename in os.listdir(data_dir):
@@ -273,12 +368,10 @@ class TaticTensorCollector(TensorCollector):
                 if pcap_file is None or summary_file is None:
                     continue
 
-                # Build valid flow IDs
                 vaild_flow_ids = build_vaild_flow_ids(summary_file)
                 if len(vaild_flow_ids) == 0:
                     continue
 
-                # Extract packet lengths for each TCP flow
                 flows = extract_flows(
                     pcap_file,
                     extract_features=[
@@ -299,7 +392,6 @@ class TaticTensorCollector(TensorCollector):
                     website_idx,
                 )
 
-                # filter zero
                 if np.all(np.array(X_i) == 0):
                     continue
 
@@ -313,15 +405,29 @@ class TaticTensorCollector(TensorCollector):
 
 
 class GraphTensorCollector(TensorCollector):
+    """图特征采集器基类，定义图数据采集的通用流程。
+
+    子类需要实现 _do_collect 和 _output_node_feature_dimension。
+
+    Args:
+        sample_file_dir: 原始数据目录
+        num_flow_padding: 每个样本保留的最大流数（图节点数 M）
+        num_packet_padding: 每条流保留的最大包数（节点特征长度 L）
+        edge_build_method: 边构建方法
+        flow_cluster_time_window: 时空边的时间窗口宽度
+        tls_node_padding: TLS 序列固定长度
+        tls_threshold: TLS 特征采集的时间窗口宽度
+    """
+
     def __init__(
         self,
-        sample_file_dir: str = "",  # sample files director
-        num_flow_padding: int = 32,  # flow num padding
-        num_packet_padding: int = 128,  # packet num padding
-        edge_build_method: str = "spatio_temporal",  # edge building method
-        flow_cluster_time_window=0.3, # flow cluster time window
-        tls_node_padding: int = 8,  # number of TLS nodes
-        tls_threshold: float = 0.3,  # time threshold, only get [flow_start_time, flow_start_time + threshold] flows for TLS feature
+        sample_file_dir: str = "",
+        num_flow_padding: int = 32,
+        num_packet_padding: int = 128,
+        edge_build_method: str = "spatio_temporal",
+        flow_cluster_time_window=0.3,
+        tls_node_padding: int = 8,
+        tls_threshold: float = 0.3,
     ):
         super().__init__(sample_file_dir=sample_file_dir)
         self.expected_num_flows = num_flow_padding
@@ -342,12 +448,13 @@ class GraphTensorCollector(TensorCollector):
         flow_cluster_time_window: float,
         website_id: int,
     ) -> tuple[list, list, list, list]:
-        """
-        子类实现具体的特征提取逻辑，返回 (X, edge_index, Y, edge_attr)
-        X: list of list, shape (M, D)
-        edge_index: list of list, shape (2, E)
-        Y: list, shape (1,)
-        edge_attr: list of list, shape (E, F)
+        """提取节点特征矩阵、边索引、标签和边属性。
+
+        Returns:
+            X: list of list，shape (M, D)
+            edge_index: list of list，shape (2, E)
+            Y: list，shape (1,)
+            edge_attr: list of list，shape (E, F)
         """
         raise NotImplementedError
 
@@ -372,6 +479,7 @@ class GraphTensorCollector(TensorCollector):
 
     @override
     def sample_iter(self):
+        """遍历目录，提取图特征，yield (X_i, edge_i, y_i, edge_attr, T_i)。"""
         idx = 1
         website_idx = -1
         for website_name in os.listdir(self.sample_file_dir):
@@ -384,7 +492,6 @@ class GraphTensorCollector(TensorCollector):
                 data_dir = os.path.join(website_folder, instance_id)
                 if not os.path.isdir(data_dir):
                     continue
-                # Find pcap file and summary file
                 pcap_file = None
                 summary_file = None
                 for filename in os.listdir(data_dir):
@@ -396,12 +503,10 @@ class GraphTensorCollector(TensorCollector):
                 if pcap_file is None or summary_file is None:
                     continue
 
-                # Build valid flow IDs
                 vaild_flow_ids = build_vaild_flow_ids(summary_file)
                 if len(vaild_flow_ids) == 0:
                     continue
 
-                # Extract packet lengths for each TCP flow
                 flows = extract_flows(
                     pcap_file,
                     extract_features=[
@@ -420,7 +525,7 @@ class GraphTensorCollector(TensorCollector):
                 if len(flows) == 0:
                     continue
 
-                # collect TLS features
+                # TLS 头部特征采集（早期时间窗口）
                 tls_header_collector = TLSHeaderTensorCollector(
                     threshold=self.tls_threshold
                 )
@@ -434,7 +539,6 @@ class GraphTensorCollector(TensorCollector):
                     website_idx,
                 )
 
-                # filter zero
                 if np.all(np.array(X_i) == 0) or np.all(np.array(edge_i) == 0):
                     continue
 
@@ -448,6 +552,13 @@ class GraphTensorCollector(TensorCollector):
 
 
 class CUMULTensorCollector(TensorCollector):
+    """CUMUL 特征采集器：提取每条流的包长序列并补零/截断到固定长度。
+
+    Args:
+        sample_file_dir: 原始数据目录
+        expected_packet_length: 每流保留的最大包数
+    """
+
     def __init__(self, sample_file_dir, expected_packet_length=100):
         super().__init__(sample_file_dir=sample_file_dir)
         self.expected_packet_length = expected_packet_length
@@ -468,7 +579,7 @@ class CUMULTensorCollector(TensorCollector):
         packet_nums_padding: int,
         website_id: int,
     ):
-        # 提取每个流的包长序列
+        """提取每条流的包长序列（补零/截断到 packet_nums_padding）。"""
         packet_lengths = [flow.get("packet_length", []) for flow in flows.values()]
         X_i = []
         for pkt_len_seq in packet_lengths:
@@ -481,6 +592,7 @@ class CUMULTensorCollector(TensorCollector):
 
     @override
     def sample_iter(self):
+        """遍历目录，提取 CUMUL 特征，yield (X_i, y_i)。"""
         idx = 1
         website_idx = -1
         for website_name in os.listdir(self.sample_file_dir):
@@ -493,7 +605,6 @@ class CUMULTensorCollector(TensorCollector):
                 data_dir = os.path.join(website_folder, instance_id)
                 if not os.path.isdir(data_dir):
                     continue
-                # Find pcap file and summary file
                 pcap_file = None
                 summary_file = None
                 for filename in os.listdir(data_dir):
@@ -505,12 +616,10 @@ class CUMULTensorCollector(TensorCollector):
                 if pcap_file is None or summary_file is None:
                     continue
 
-                # Build valid flow IDs
                 vaild_flow_ids = build_vaild_flow_ids(summary_file)
                 if len(vaild_flow_ids) == 0:
                     continue
 
-                # Extract packet lengths for each TCP flow
                 flows = extract_flows(
                     pcap_file,
                     extract_features=[
@@ -535,7 +644,6 @@ class CUMULTensorCollector(TensorCollector):
                     website_idx,
                 )
 
-                # filter zero
                 if np.all(np.array(X_i) == 0):
                     continue
 
@@ -549,6 +657,11 @@ class CUMULTensorCollector(TensorCollector):
 
 
 class STGCGraphTensorCollector(GraphTensorCollector):
+    """STGC（Spatio-Temporal Graph Convolution）图特征采集器，供 MFTS 模型使用。
+
+    节点特征维度 = packet_nums_padding + 6（包长序列 + 6 个统计量）
+    相比 TanticGraphTensorCollector，特征更精简，训练更快。
+    """
 
     @override
     def _output_node_feature_dimension(self) -> int:
@@ -563,13 +676,17 @@ class STGCGraphTensorCollector(GraphTensorCollector):
         flow_cluster_time_window: float,
         website_id: int,
     ) -> tuple[list, list, list, list]:
+        """提取节点特征矩阵和图结构。
+
+        节点特征构成：
+            前 L 维：包长序列（归一化 / 1500）
+            后 6 维：[上行最大包长, 总包长绝对和, 上行90分位, 下行总长, 下行80分位, 下行均值]
+        """
         M = flows_nums_padding
         L = packet_nums_padding
-        X = np.zeros(
-            (M, L + 6), dtype=np.float32
-        )  # pkt_len + time_diffs + 3 * 18 stats
+        X = np.zeros((M, L + 6), dtype=np.float32)
 
-        # 按照 flow_start_time 排序选取
+        # 按起始时间排序，保留前 M 条流（时间靠前的流含更多早期信息）
         flows_list = [
             flow
             for _, flow in sorted(
@@ -578,29 +695,23 @@ class STGCGraphTensorCollector(GraphTensorCollector):
         ]
 
         for row_idx, flow in enumerate(flows_list):
-
-            # pkt_lengths seq feature
-            # 归一化
-            MAX_LEN = 1500.0  # 或你想用的上限
+            MAX_LEN = 1500.0  # MTU 最大值，用于归一化到 [0, 1]
             pkt_lengths = pad_trunc_1d(flow.get("packet_length", []), L, pad_value=0)
             pkt_lengths = pkt_lengths / MAX_LEN
 
-            # time_diffs seq feature
             timestamps = pad_trunc_1d(
                 flow.get("timestamp", []), L, pad_value=0.0, dtype=np.float64
             )
             times_diffs = np.zeros(L, dtype=np.float64)
             if L > 1:
                 times_diffs[1:] = np.diff(timestamps)
-
             times_diffs = times_diffs.astype(np.float32)
 
-            # statistics features
             np_pkt_lengths = np.array(pkt_lengths)
-            outbound = np_pkt_lengths[np_pkt_lengths > 0]
-            inbound = -np_pkt_lengths[np_pkt_lengths < 0]
+            outbound = np_pkt_lengths[np_pkt_lengths > 0]  # 上行（下行流量为正）
+            inbound = -np_pkt_lengths[np_pkt_lengths < 0]  # 下行（取绝对值）
 
-            # umax, alen, uper 9, dlen, uper 8, and dmean a
+            # 6 个统计特征：捕捉流的宏观流量模式
             umax = np.max(outbound) if outbound.size > 0 else 0.0
             alen = np.sum(np.abs(np_pkt_lengths)) if np_pkt_lengths.size > 0 else 0.0
             uper9 = np.percentile(outbound, 90) if outbound.size > 0 else 0.0
@@ -611,14 +722,12 @@ class STGCGraphTensorCollector(GraphTensorCollector):
             flow_vec = np.zeros(
                 (self._output_node_feature_dimension(),), dtype=np.float32
             )
-
             flow_vec[:L] = pkt_lengths
             flow_vec[L : L + 6] = np.array(
                 [umax, alen, uper9, dlen, dper8, dmean], dtype=np.float32
             )
             X[row_idx] = flow_vec
 
-        # edge_index 构建并保存
         edge_builder = EdgeIndexBuilder(
             flows=flows_list,
             add_self_loops=True,
@@ -630,7 +739,7 @@ class STGCGraphTensorCollector(GraphTensorCollector):
             threshold=flow_cluster_time_window
         )
 
-        Y = np.array([website_id], dtype=np.int64)  # 从 0 开始编号
+        Y = np.array([website_id], dtype=np.int64)
 
         assert X.shape == (M, self._output_node_feature_dimension())
         assert edge_index.shape[0] == 2
@@ -641,6 +750,14 @@ class STGCGraphTensorCollector(GraphTensorCollector):
 
 
 class TanticGraphTensorCollector(GraphTensorCollector):
+    """Tantic 图特征采集器，节点特征更丰富（包含 18 维全量统计特征 × 3）。
+
+    节点特征维度 = 2 * packet_nums_padding + 54
+        前 L 维：包长序列
+        中 L 维：包间时间差序列
+        后 54 维：all/inbound/outbound 各 18 维统计特征
+    """
+
     @override
     def _output_node_feature_dimension(self) -> int:
         return 2 * self.expected_packet_length + 54
@@ -656,11 +773,8 @@ class TanticGraphTensorCollector(GraphTensorCollector):
         M = flows_nums_padding
         L = packet_nums_padding
 
-        X = np.zeros(
-            (M, L + L + 3 * 18), dtype=np.float32
-        )  # pkt_len + time_diffs + 3 * 18 stats
+        X = np.zeros((M, L + L + 3 * 18), dtype=np.float32)
 
-        # 按照 flow_start_time 排序选取
         flows_list = [
             flow
             for _, flow in sorted(
@@ -669,33 +783,27 @@ class TanticGraphTensorCollector(GraphTensorCollector):
         ]
 
         for row_idx, flow in enumerate(flows_list):
-
-            # pkt_lengths seq feature
-            # 归一化
-            MAX_LEN = 1500.0  # 或你想用的上限
+            MAX_LEN = 1500.0
             pkt_lengths = pad_trunc_1d(flow.get("packet_length", []), L, pad_value=0)
             pkt_lengths = pkt_lengths / MAX_LEN
 
-            # time_diffs seq feature
             timestamps = pad_trunc_1d(
                 flow.get("timestamp", []), L, pad_value=0.0, dtype=np.float64
             )
             times_diffs = np.zeros(L, dtype=np.float64)
             if L > 1:
                 times_diffs[1:] = np.diff(timestamps)
-
             times_diffs = times_diffs.astype(np.float32)
 
-            # statistics features
             np_pkt_lengths = np.array(pkt_lengths)
             outbound = np_pkt_lengths[np_pkt_lengths > 0]
             inbound = -np_pkt_lengths[np_pkt_lengths < 0]
-            all_stats = stats_18(pkt_lengths[pkt_lengths != 0])  # 可选：排除 padding 0
+            # 18 维全量统计（排除 padding 的 0 值，避免统计结果被零填充污染）
+            all_stats = stats_18(pkt_lengths[pkt_lengths != 0])
             in_stats = stats_18(inbound)
             out_stats = stats_18(outbound)
 
             flow_vec = np.zeros((2 * L + 54,), dtype=np.float32)
-
             flow_vec[:L] = pkt_lengths
             flow_vec[L : 2 * L] = times_diffs
             flow_vec[2 * L : 2 * L + 18] = all_stats
@@ -704,7 +812,6 @@ class TanticGraphTensorCollector(GraphTensorCollector):
 
             X[row_idx] = flow_vec
 
-        # edge_index 构建并保存
         edge_builder = EdgeIndexBuilder(
             flows=flows_list,
             add_self_loops=True,
@@ -714,7 +821,7 @@ class TanticGraphTensorCollector(GraphTensorCollector):
 
         edge_index, edge_attr = edge_builder.build_edges(threshold=0.3)
 
-        Y = np.array([website_id], dtype=np.int64)  # 从 0 开始编号
+        Y = np.array([website_id], dtype=np.int64)
 
         assert X.shape == (M, self._output_node_feature_dimension())
         assert edge_index.shape[0] == 2
