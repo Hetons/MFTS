@@ -148,7 +148,7 @@ if __name__ == "__main__":
         warmup_steps=20,
         measure_steps=100,
     )
-    print_profile_metrics("TLS-only", tls_profile)
+    print_profile_metrics("MFTS-early Evaluation", tls_profile)
 
     payload_profile = profile_model_inference(
         model=PayloadForwardWrapper(model.payload_model),
@@ -157,10 +157,10 @@ if __name__ == "__main__":
         warmup_steps=20,
         measure_steps=100,
     )
-    print_profile_metrics("Payload-only", payload_profile)
+    print_profile_metrics("MFTS-refine Evaluation", payload_profile)
 
     # ==================== Payload-only 评估 ====================
-    print("\n=== Payload-only Evaluation ===")
+    print("\n=== MFTS-refine Evaluation ===")
     payload_preds, payload_trues = [], []
     model.payload_model.eval()
 
@@ -185,7 +185,7 @@ if __name__ == "__main__":
     )
 
     # ==================== TLS-only 评估 ====================
-    print("\n=== TLS-only Evaluation ===")
+    print("\n=== MFTS-early Evaluation ===")
     tls_preds, tls_trues = [], []
     model.tls_model.eval()
 
@@ -281,8 +281,8 @@ if __name__ == "__main__":
     print("\n" + "=" * 70)
     print("Performance Comparison")
     print("=" * 70)
-    print(f"TLS-only:     {tls_acc:.4f}")
-    print(f"Payload-only: {payload_acc:.4f}")
+    print(f"MFTS-early:     {tls_acc:.4f}")
+    print(f"MFTS-refine: {payload_acc:.4f}")
     print(f"Fusion:       {fusion_acc:.4f}")
     print(
         f"\nFusion vs Best Single Model: {fusion_acc - max(tls_acc, payload_acc):+.4f}"

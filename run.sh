@@ -22,6 +22,6 @@ echo "==============================="
 python /home/tyf/Project/Tantic/src/models/cumul/cumul.py
 
 
-# echo "4. Testing Tatic model..."
-# echo "==============================="
-# python /home/tyf/Project/Tantic/src/models/tantic/model.py
+echo "4. Testing Tatic model..."
+echo "==============================="
+python /home/tyf/Project/Tantic/src/models/tatic/03_easy-hard_classification/main.py   
